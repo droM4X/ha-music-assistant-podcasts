@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Music Assistant Podcasts",
+        "description": "Kapcsolódás a Music Assistant szerverhez a legfrissebb podcast epizódok összegyűjtéséhez.",
+        "data": {
+          "server_url": "Music Assistant szerver URL",
+          "token": "Long-lived access token (Beállítások → Profil → Long-lived access tokens)",
+          "username": "Felhasználónév (alternatíva: létrehozzuk a tokent helyetted)",
+          "password": "Jelszó"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Újrahitelesítés — Music Assistant Podcasts",
+        "description": "A Music Assistant token már nem érvényes. Adj meg egy új long-lived tokent, vagy felhasználónevet és jelszót, amiből automatikusan létrehozunk egyet.",
+        "data": {
+          "token": "Új long-lived access token",
+          "username": "Felhasználónév",
+          "password": "Jelszó"
+        }
+      }
+    },
+    "error": {
+      "missing_auth": "Adj meg egy long-lived tokent, vagy felhasználónevet és jelszót.",
+      "invalid_auth": "A hitelesítés sikertelen: ellenőrizd a tokent vagy a bejelentkezési adatokat.",
+      "cannot_connect": "Nem sikerült kapcsolódni a Music Assistant szerverhez.",
+      "unknown": "Váratlan hiba a Music Assistant kapcsolódás közben."
+    },
+    "abort": {
+      "reauth_successful": "Az újrahitelesítés sikerült."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Music Assistant Podcasts beállítások",
+        "data": {
+          "episodes_per_feed": "Letöltött epizódok száma feed-enként",
+          "list_size": "A lista maximális hossza",
+          "update_interval_minutes": "Automatikus frissítés (perc)",
+          "default_player": "Alapértelmezett lejátszó",
+          "force_refresh": "Mindig friss epizódadatokat kérjünk a providertől (lassabb)"
+        }
+      }
+    }
+  },
+  "services": {
+    "refresh": {
+      "name": "Frissítés",
+      "description": "A legfrissebb podcast epizódok listájának frissítése a Music Assistantból."
+    },
+    "play_episode": {
+      "name": "Epizód lejátszása",
+      "description": "Egy podcast epizód lejátszása a megadott Music Assistant lejátszón.",
+      "fields": {
+        "episode_uri": {
+          "name": "Epizód URI",
+          "description": "A podcast epizód URI-ja, pl. library://podcast_episode/1/2."
+        },
+        "entity_id": {
+          "name": "Lejátszó",
+          "description": "Cél mediálejátszó (alapból a beállított lejátszó)."
+        }
+      }
+    }
+  }
+}

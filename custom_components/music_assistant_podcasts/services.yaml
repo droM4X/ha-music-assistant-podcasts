@@ -1,0 +1,25 @@
+refresh:
+  name: Refresh
+  description: Refresh the list of latest podcast episodes from Music
+    Assistant.
+
+play_episode:
+  name: Play episode
+  description: >-
+    Play a single podcast episode on a Music Assistant player. The episode
+    URI comes from the latest_podcast_episodes sensor attributes.
+  fields:
+    episode_uri:
+      name: Episode URI
+      description: URI of the podcast episode, e.g.
+        library://podcast_episode/1/2.
+      required: true
+      example: library://podcast_episode/1/2
+      selector:
+        text:
+    entity_id:
+      name: Player
+      description: Target media player (defaults to the configured player).
+      selector:
+        entity:
+          domain: media_player

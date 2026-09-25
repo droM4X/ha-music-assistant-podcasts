@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Music Assistant Podcasts",
+        "description": "Connect to your Music Assistant server to aggregate the latest podcast episodes.",
+        "data": {
+          "server_url": "Music Assistant server URL",
+          "token": "Long-lived access token (Settings → Profile → Long-lived access tokens)",
+          "username": "Username (alternative: we create the token for you)",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Music Assistant Podcasts",
+        "description": "The Music Assistant token is no longer valid. Enter a new long-lived token, or your username and password to create one automatically.",
+        "data": {
+          "token": "New long-lived access token",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "missing_auth": "Provide a long-lived token or a username and password.",
+      "invalid_auth": "Authentication failed: check the token or credentials.",
+      "cannot_connect": "Cannot connect to the Music Assistant server.",
+      "unknown": "Unexpected error connecting to Music Assistant."
+    },
+    "abort": {
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Music Assistant Podcasts options",
+        "data": {
+          "episodes_per_feed": "Episodes fetched per podcast feed",
+          "list_size": "Maximum episodes in the list",
+          "update_interval_minutes": "Auto refresh interval (minutes)",
+          "default_player": "Default playback target",
+          "force_refresh": "Ask providers for fresh episode data on every refresh (slower)"
+        }
+      }
+    }
+  },
+  "services": {
+    "refresh": {
+      "name": "Refresh",
+      "description": "Refresh the list of latest podcast episodes from Music Assistant."
+    },
+    "play_episode": {
+      "name": "Play episode",
+      "description": "Play a single podcast episode on a Music Assistant player.",
+      "fields": {
+        "episode_uri": {
+          "name": "Episode URI",
+          "description": "URI of the podcast episode, e.g. library://podcast_episode/1/2."
+        },
+        "entity_id": {
+          "name": "Player",
+          "description": "Target media player (defaults to the configured player)."
+        }
+      }
+    }
+  }
+}
