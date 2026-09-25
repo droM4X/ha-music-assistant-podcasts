@@ -21,6 +21,9 @@ library into a single Home Assistant sensor, with a custom dashboard card.
 - Authenticated image proxy — the Music Assistant token never reaches the
   browser
 
+## Preview
+<div><img src="assets/card-light.jpg" width="49%"> <img src="assets/card-dark.jpg" width="49%"></div>
+
 ## Setup
 ### HACS
 - HACS → top-right menu → Custom repositories
