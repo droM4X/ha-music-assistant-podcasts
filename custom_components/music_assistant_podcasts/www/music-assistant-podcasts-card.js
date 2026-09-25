@@ -29,6 +29,7 @@ const DEMO_EPISODES = [
   {
     title: "248. rész – Csak azért is, mert mindenki fél tőle",
     podcast: "HetiVálasz Podcast",
+    podcast_fav: true,
     published: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
     duration: 3540,
     position: 1200,
@@ -39,6 +40,7 @@ const DEMO_EPISODES = [
   {
     title: "A mesterséges intelligencia és a hosszú út az emberi gondolatig",
     podcast: "Qubit Podcast",
+    podcast_fav: true,
     published: new Date(Date.now() - 26 * 3600 * 1000).toISOString(),
     duration: 3180,
     position: 0,
@@ -49,6 +51,7 @@ const DEMO_EPISODES = [
   {
     title: "Körkép: így alakult a hét a pénzpiacokon",
     podcast: "Portfolio",
+    podcast_fav: false,
     published: new Date(Date.now() - 2 * 86400 * 1000).toISOString(),
     duration: 1740,
     position: 1740,
@@ -59,6 +62,7 @@ const DEMO_EPISODES = [
   {
     title: "Ahol a kék bolygó még kék – óceánkutatás a parttól a mélységig",
     podcast: "Hihetetlen Történelem Podcast",
+    podcast_fav: false,
     published: new Date(Date.now() - 4 * 86400 * 1000).toISOString(),
     duration: 4980,
     position: 0,
@@ -79,6 +83,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
     this._lastSignature = null;
     this._raf = null;
     this._pollTimer = null;
+    this._favOnly = false;
   }
 
   setConfig(config) {
@@ -138,6 +143,9 @@ class MapodcastsEpisodesCard extends HTMLElement {
       attrs && Array.isArray(attrs.episodes) ? attrs.episodes : [];
     if (!this._config.show_played) {
       eps = eps.filter((ep) => this._stateOf(ep) !== "finished");
+    }
+    if (this._favOnly) {
+      eps = eps.filter((ep) => !!ep.podcast_fav);
     }
     if (eps.length) return eps.slice(0, this._config.max_items);
     // no entity configured (e.g. card picker preview) → demo rows
@@ -482,6 +490,23 @@ class MapodcastsEpisodesCard extends HTMLElement {
       }
       .header .refresh { cursor: pointer; color: var(--secondary-text-color); }
       .header .refresh:hover { color: var(--primary-color, #03a9f4); }
+      .header .fav-btn {
+        display: flex; align-items: center; gap: 6px;
+        margin-inline-start: auto;   /* right-align, keep space from the title */
+        margin-inline-end: 8px;      /* spacing before the refresh button */
+        padding: 4px 12px; border-radius: 16px;
+        border: 1px solid var(--divider-color, #444);
+        background: transparent;
+        color: var(--secondary-text-color);
+        font-size: 0.85em; cursor: pointer;
+        transition: color 0.15s ease, border-color 0.15s ease;
+      }
+      .header .fav-btn:hover { color: var(--primary-color, #03a9f4); }
+      .header .fav-btn.active {
+        color: var(--warning-color, #ff9800);
+        border-color: currentColor;
+      }
+      .header .fav-btn .fav-star { --mdc-icon-size: 18px; }
       .row {
         display: flex; align-items: center; gap: 12px;
         padding: 8px 0; border-top: 1px solid var(--divider-color, #333);
@@ -592,6 +617,22 @@ class MapodcastsEpisodesCard extends HTMLElement {
     titleWrap.appendChild(this._haIcon("mdi:microphone", null));
     titleWrap.appendChild(this._el("span", null, this._config.title));
     header.appendChild(titleWrap);
+    const favBtn = document.createElement("button");
+    favBtn.className = "fav-btn";
+    favBtn.title = this._isHu() ? "Kedvencek" : "Favorites";
+    favBtn.appendChild(
+      this._haIcon(this._favOnly ? "mdi:star" : "mdi:star-outline", "fav-star")
+    );
+    favBtn.appendChild(
+      this._el("span", null, this._isHu() ? "Kedvencek" : "Favorites")
+    );
+    favBtn.classList.toggle("active", this._favOnly);
+    favBtn.addEventListener("click", () => {
+      this._favOnly = !this._favOnly;
+      this._lastSignature = null; // force rebuild with the filter applied
+      this._render();
+    });
+    header.appendChild(favBtn);
     const refreshBtn = this._haIcon("mdi:refresh", "refresh");
     refreshBtn.title = "Refresh";
     refreshBtn.addEventListener("click", () => this._refresh());

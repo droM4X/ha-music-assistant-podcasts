@@ -1,7 +1,7 @@
 {
   "domain": "music_assistant_podcasts",
   "name": "Music Assistant Podcasts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "documentation": "https://github.com/droM4X/ha-music-assistant-podcasts",
   "issue_tracker": "https://github.com/droM4X/ha-music-assistant-podcasts/issues",
   "codeowners": ["@droM4X"],

@@ -44,6 +44,7 @@ EP_POSITION = "position"
 EP_PLAYED = "played"
 EP_STATE = "state"  # unplayed | in_progress | finished
 EP_IMAGE = "image"
+EP_PODCAST_FAV = "podcast_fav"
 
 # Service names
 SERVICE_REFRESH = "refresh"

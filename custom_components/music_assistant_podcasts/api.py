@@ -32,6 +32,7 @@ from .const import (
     EP_DURATION,
     EP_IMAGE,
     EP_PODCAST,
+    EP_PODCAST_FAV,
     EP_PODCAST_URI,
     EP_POSITION,
     EP_PUBLISHED,
@@ -117,6 +118,7 @@ class MusicAssistantPodcastApi:
                 {
                     EP_TITLE: episode.name,
                     EP_PODCAST: podcast.name,
+                    EP_PODCAST_FAV: bool(getattr(podcast, "favorite", False)),
                     EP_PODCAST_URI: podcast.uri,
                     EP_URI: episode.uri,
                     EP_PUBLISHED: published,
