@@ -16,6 +16,7 @@ library into a single Home Assistant sensor, with a custom dashboard card.
 - Live progress bar and remaining time (polled, no full refresh needed)
 - Podcast name links to the podcast page in the Music Assistant web UI
 - Seamless marquee on overflowing episode titles (hover only)
+- Favourite shows
 - Auto-registered, versioned Lovelace card with an interactive editor and
   YAML mode; follows the Home Assistant language
 - Authenticated image proxy — the Music Assistant token never reaches the
