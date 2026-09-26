@@ -26,7 +26,7 @@ from .const import (
     CONF_TOKEN,
     DOMAIN,
 )
-from .coordinator import PodcastsCoordinator
+from .coordinator import PlayStateCoordinator, PodcastsCoordinator
 from .services import async_register_services, async_unregister_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,6 +60,17 @@ async def _register_card_frontend(hass: HomeAssistant) -> None:
     integration = await async_get_integration(hass, DOMAIN)
     url = f"{CARD_STATIC_PATH}/{CARD_FILENAME}?v={integration.version}"
     resource_path = f"{CARD_STATIC_PATH}/{CARD_FILENAME}"
+
+    # register the authenticated proxy views (image + progress + description),
+    # once per HA process — MUST happen before any early return below, or the
+    # endpoints silently vanish after a restart (the lovelace resource survives
+    # in storage, so 'found' would be true and nothing else would be served
+    # under the card path but the static files — POSTs then 405, GETs 404).
+    if not registered.get("view_registered"):
+        hass.http.register_view(views.MAPodcastImageView())
+        hass.http.register_view(views.MAPodcastProgressView())
+        hass.http.register_view(views.MAPodcastDescriptionView())
+        registered["view_registered"] = True
 
     lovelace = hass.data["lovelace"]
     resources = (
@@ -102,12 +113,6 @@ async def _register_card_frontend(hass: HomeAssistant) -> None:
     else:
         add_extra_js_url(hass, url)
 
-    # register the authenticated proxy views (image + progress), once
-    if not registered.get("view_registered"):
-        hass.http.register_view(views.MAPodcastImageView())
-        hass.http.register_view(views.MAPodcastProgressView())
-        registered["view_registered"] = True
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Music Assistant Podcasts from a config entry."""
@@ -126,9 +131,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = PodcastsCoordinator(hass, api, entry)
     await coordinator.async_config_entry_first_refresh()
 
+    # lightweight play-state sync; a failed first cycle must not block setup
+    play_coordinator = PlayStateCoordinator(hass, api, entry)
+    await play_coordinator.async_refresh()
+
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
         "coordinator": coordinator,
+        "play_coordinator": play_coordinator,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

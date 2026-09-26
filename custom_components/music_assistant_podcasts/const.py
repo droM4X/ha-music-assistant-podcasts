@@ -7,9 +7,9 @@ DOMAIN = "music_assistant_podcasts"
 MANUFACTURER = "Music Assistant Podcasts"
 
 CONF_SERVER_URL = "server_url"
-CONF_TOKEN = "token"
+CONF_TOKEN = "token"  # nosec: config option *name*, not a secret
 CONF_USERNAME = "username"
-CONF_PASSWORD = "password"
+CONF_PASSWORD = "password"  # nosec: config option *name*, not a secret
 
 # Options
 CONF_EPISODES_PER_FEED = "episodes_per_feed"
@@ -45,6 +45,23 @@ EP_PLAYED = "played"
 EP_STATE = "state"  # unplayed | in_progress | finished
 EP_IMAGE = "image"
 EP_PODCAST_FAV = "podcast_fav"
+
+# Play-state sync
+# Short TTL for the api-level cache behind the card's progress polls (so
+# rapid polls never hammer the MA server with one connection per poll). Set
+# above the burst-poll spacing (2/6/12 s) so the middle poll hits the cache.
+STATE_CACHE_TTL = 8
+# The lightweight PlayStateCoordinator polls fast while something is playing
+# and backs off to a slow interval when nothing is in progress.
+PLAY_STATE_ACTIVE_INTERVAL = 60  # seconds
+PLAY_STATE_IDLE_INTERVAL = 900  # seconds
+# How long a uri the card asked about stays tracked by the play-state
+# coordinator (so its finish/reset transition is seen even when it drops
+# out of MA's in-progress list).
+PLAY_STATE_TRACKED_TTL = 1800  # seconds
+# Descriptions are fetched on demand (they can be long, so they never go
+# into the episodes sensor) and effectively never change → long cache TTL.
+DESC_CACHE_TTL = 6 * 3600  # seconds
 
 # Service names
 SERVICE_REFRESH = "refresh"

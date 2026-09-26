@@ -11,16 +11,22 @@ library into a single Home Assistant sensor, with a custom dashboard card.
 - "Latest episodes" list (default: 50) merged from all subscribed podcast
   feeds, sorted by publish date
 - Play state per episode: unplayed / in progress (with position) / finished
-- Episode title click starts playback; hovering a row shows a play overlay on
-  the cover
-- Live progress bar and remaining time (polled, no full refresh needed)
+- Cover image is the play trigger (hover overlay / tap) with a short
+  "starting playback" toast on the row
+- Episode title click opens an expandable, scrollable description
+  (full-width panel, bold title on top, one open at a time) — descriptions
+  are fetched on demand from Music Assistant, never stored in the sensor
+- Live progress bar and remaining time — position comes from the MA player
+  entity in real time; play states sync through a lightweight coordinator
+  (fast while playing, slow otherwise) plus on-demand polling of the last
+  started episode
 - Podcast name links to the podcast page in the Music Assistant web UI
 - Seamless marquee on overflowing episode titles (hover only)
 - Favourite shows
 - Auto-registered, versioned Lovelace card with an interactive editor and
   YAML mode; follows the Home Assistant language
-- Authenticated image proxy — the Music Assistant token never reaches the
-  browser
+- Authenticated image/progress/description proxies — the Music Assistant
+  token never reaches the browser
 
 ## Preview
 <div><img src="assets/card-light.jpg" width="49%"> <img src="assets/card-dark.jpg" width="49%"></div>

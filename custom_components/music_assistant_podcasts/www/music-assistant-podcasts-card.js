@@ -14,15 +14,28 @@
  *
  * Layout per row:
  *   row 1 (info):  podcast name · published · length · "még X perc"
- *   row 2:         episode title (click = play; seamless marquee on hover
- *                  when it does not fit)
+ *   row 2:         episode title (click = toggles a scrollable description
+ *                  panel under the row, one open at a time; seamless marquee
+ *                  on hover when it does not fit)
  *
- * Extras: hover shows a play overlay on the cover image; podcast name links
- * to the MA web UI; progress bars update live via the progress endpoint.
+ * Extras: the cover image is the play trigger (hover overlay; on touch a
+ * tap starts playback) with a short "starting playback" toast on the row;
+ * podcast name links to the MA web UI; progress bars update live via the
+ * progress endpoint.
  */
 
 const CARD_NAME = "music-assistant-podcasts-card";
-const PROGRESS_POLL_SECONDS = 30;
+// Adaptive progress polling: fast while something is playing, slow otherwise.
+const PROGRESS_POLL_ACTIVE_SECONDS = 10;
+const PROGRESS_POLL_IDLE_SECONDS = 60;
+// Extra polls right after a play click (provider resume points can lag).
+const PROGRESS_BURST_DELAYS_MS = [2000, 6000, 12000];
+// After a play click the episode is optimistically shown as in progress for
+// this long (and a premature "finished" from MA is distrusted until a poll
+// arrives after the grace window).
+const PLAY_GRACE_MS = 45000;
+// description panel: natural height up to this, then internal scrolling
+const DESC_PANEL_MAX_HEIGHT = 300;
 
 // Sample rows shown when no sensor entity is configured (card picker preview)
 const DEMO_EPISODES = [
@@ -79,10 +92,17 @@ class MapodcastsEpisodesCard extends HTMLElement {
     this._config = {};
     this._hass = null;
     this._imgCache = new Map();
-    this._progress = new Map(); // episode uri -> {position, fully_played}
+    this._progress = new Map(); // episode uri -> {position, fully_played, state}
     this._lastSignature = null;
     this._raf = null;
-    this._pollTimer = null;
+    this._pollTimer = null; // setTimeout handle (adaptive reschedule)
+    this._burstTimers = new Set(); // post-play burst poll handles
+    this._descCache = new Map(); // episode uri -> description (string|null)
+    this._descLoading = new Set();
+    this._expandedUri = null; // currently open description panel
+    this._optimistic = new Map(); // episode uri -> grace deadline (ms epoch)
+    this._lastPollAt = 0; // ms epoch of the last successful progress poll
+    this._lastPlayed = null; // uri of the episode last started from this card
     this._favOnly = false;
   }
 
@@ -156,18 +176,90 @@ class MapodcastsEpisodesCard extends HTMLElement {
   }
 
   _stateOf(ep) {
+    // while the player is actively playing this episode, the bar is live and
+    // the state is in progress (finished-ness comes from fully_played polls)
+    if (this._livePlayerPosition(ep) !== null) return "in_progress";
+    const dur = ep.duration || 0;
     const live = this._progress.get(ep.uri);
     if (live) {
-      if (live.fully_played) return "finished";
-      if (live.position > 0) return "in_progress";
-      return "unplayed";
+      const pos = live.position || 0;
+      let state;
+      if (live.fully_played) {
+        // trust "finished" only when the resume point agrees: at the very
+        // start (re-listen marker) or near the end. Otherwise the provider
+        // probably just hasn't reset the flag yet → still in progress.
+        state =
+          pos === 0 || (dur > 0 && pos >= dur * 0.9)
+            ? "finished"
+            : "in_progress";
+      } else if (pos > 0) {
+        state = "in_progress";
+      } else {
+        state = "unplayed";
+      }
+      // grace right after a play click: don't flash back to "finished" while
+      // the provider hasn't updated the resume point yet. Polls that arrive
+      // after the grace window are trusted again.
+      const until = this._optimistic.get(ep.uri);
+      if (
+        until &&
+        state === "finished" &&
+        !(dur > 0 && pos >= dur * 0.9) &&
+        (Date.now() < until || this._lastPollAt <= until)
+      ) {
+        state = "in_progress";
+      }
+      return state;
     }
+    // no live data yet: an optimistic play click keeps it in progress
+    const until = this._optimistic.get(ep.uri);
+    if (until && Date.now() < until) return "in_progress";
     return ep.state || "unplayed";
   }
 
+  // ---- live position from the MA player entity -----------------------------
+
+  _maPlayerId() {
+    if (this._config.player) return this._config.player;
+    const states = this._hass?.states || {};
+    return (
+      Object.keys(states).find(
+        (id) =>
+          id.startsWith("media_player.") &&
+          states[id]?.attributes?.device_class === "music_assistant"
+      ) || null
+    );
+  }
+
+  // The resume point stored in MA (what /progress returns) only advances in
+  // bigger steps; the HA media_player entity knows the true live position
+  // (media_position + media_position_updated_at, interpolated by HA). When
+  // the player is currently playing THIS episode, prefer its live position.
+  _livePlayerPosition(ep) {
+    const id = this._maPlayerId();
+    if (!id) return null;
+    const st = this._hass?.states?.[id];
+    if (!st || st.state !== "playing") return null;
+    const attrs = st.attributes || {};
+    if (!attrs.media_content_id || attrs.media_content_id !== ep.uri) {
+      return null;
+    }
+    const base = Number(attrs.media_position) || 0;
+    const updated = attrs.media_position_updated_at
+      ? new Date(attrs.media_position_updated_at).getTime()
+      : null;
+    let pos =
+      base + (updated && !Number.isNaN(updated) ? (Date.now() - updated) / 1000 : 0);
+    const dur = Number(attrs.media_duration) || ep.duration || 0;
+    if (dur > 0) pos = Math.min(pos, dur);
+    return Math.max(0, Math.round(pos));
+  }
+
   _positionOf(ep) {
-    const live = this._progress.get(ep.uri);
-    return live ? live.position : ep.position || 0;
+    const live = this._livePlayerPosition(ep);
+    if (live !== null) return live;
+    const cached = this._progress.get(ep.uri);
+    return cached ? cached.position : ep.position || 0;
   }
 
   _maUrl() {
@@ -251,10 +343,22 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
   // ---- actions -----------------------------------------------------------
 
-  _play(ep) {
+  _play(ep, row) {
     const data = { episode_uri: ep.uri };
     if (this._config.player) data.entity_id = this._config.player;
     this._hass.callService("music_assistant_podcasts", "play_episode", data);
+    this._lastPlayed = ep.uri; // this is the one the poll should watch
+    // optimistic in-progress + grace against a premature "finished"
+    this._optimistic.set(ep.uri, Date.now() + PLAY_GRACE_MS);
+    this._showPlayToast(row);
+    // burst polls so the progress bar starts moving quickly
+    for (const delay of PROGRESS_BURST_DELAYS_MS) {
+      const t = setTimeout(() => {
+        this._burstTimers.delete(t);
+        this._fetchProgress();
+      }, delay);
+      this._burstTimers.add(t);
+    }
   }
 
   _refresh() {
@@ -263,33 +367,84 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
   // ---- live progress polling ----------------------------------------------
 
+  _anyInProgress() {
+    return this._episodes().some((ep) => this._stateOf(ep) === "in_progress");
+  }
+
+  // Only one episode can play at a time: the progress poll targets exactly
+  // that one (last started here, else whatever is in progress), so we don't
+  // hammer Music Assistant with a connection burst for all visible rows.
+  // States of the other rows stay in the _progress cache untouched.
+  _activeUri() {
+    const eps = this._episodes();
+    if (this._lastPlayed && eps.some((ep) => ep.uri === this._lastPlayed)) {
+      return this._lastPlayed;
+    }
+    const inProgress = eps.find((ep) => this._stateOf(ep) === "in_progress");
+    return inProgress ? inProgress.uri : null;
+  }
+
+  _hasLiveActivity() {
+    const now = Date.now();
+    for (const until of this._optimistic.values()) {
+      if (now < until) return true;
+    }
+    return this._anyInProgress();
+  }
+
   _startPolling() {
     this._stopPolling();
-    this._pollProgress();
-    this._pollTimer = setInterval(
-      () => this._pollProgress(),
-      PROGRESS_POLL_SECONDS * 1000
-    );
+    this._poll();
   }
 
   _stopPolling() {
     if (this._pollTimer) {
-      clearInterval(this._pollTimer);
+      clearTimeout(this._pollTimer);
       this._pollTimer = null;
     }
+    for (const t of this._burstTimers) clearTimeout(t);
+    this._burstTimers.clear();
   }
 
-  async _pollProgress() {
-    if (!this._hass || !this._config.entity) return;
+  _scheduleNextPoll() {
+    const seconds = this._hasLiveActivity()
+      ? PROGRESS_POLL_ACTIVE_SECONDS
+      : PROGRESS_POLL_IDLE_SECONDS;
+    this._pollTimer = setTimeout(() => this._poll(), seconds * 1000);
+  }
+
+  _poll() {
+    this._fetchProgress().finally(() => {
+      if (this.isConnected) this._scheduleNextPoll();
+    });
+  }
+
+  async _fetchProgress() {
+    if (!this._hass || !this._config.entity || !this.isConnected) return;
+    const active = this._activeUri();
+    if (!active) return; // nothing playing — sensor states cover the rest
     try {
       const res = this._hass.fetchWithAuth
-        ? await this._hass.fetchWithAuth("/api/music_assistant_podcasts/progress")
+        ? await this._hass.fetchWithAuth(
+            "/api/music_assistant_podcasts/progress",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ uris: [active] }),
+            }
+          )
         : await fetch("/api/music_assistant_podcasts/progress", {
+            method: "POST",
             credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ uris: [active] }),
           });
-      if (!res.ok) return;
+      if (!res.ok) return; // keep the cached states on transient errors
       const data = await res.json();
-      this._progress = new Map(Object.entries(data || {}));
+      this._lastPollAt = Date.now();
+      // merge instead of replacing: rows other than the active one keep
+      // their last known state
+      this._progress = new Map([...this._progress, ...Object.entries(data || {})]);
       this._applyProgress();
     } catch {
       // ignore — next poll retries
@@ -330,7 +485,146 @@ class MapodcastsEpisodesCard extends HTMLElement {
     });
   }
 
-  // ---- rendering -----------------------------------------------------------
+  // ---- description panel (accordion, one open at a time) -----------------
+
+  _toggleDesc(ep, wrap) {
+    if (this._expandedUri === ep.uri) {
+      this._closeDesc();
+      return;
+    }
+    this._closeDesc();
+    this._openDesc(ep, wrap);
+  }
+
+  _closeDesc() {
+    const panel = this.shadowRoot.querySelector(".desc-panel");
+    if (panel) {
+      const wrap = panel.closest(".row-wrap");
+      if (wrap) wrap.classList.remove("expanded");
+      panel.remove();
+    }
+    this._expandedUri = null;
+  }
+
+  _openDesc(ep, wrap) {
+    // the panel is a child of the row wrapper (not of the flex .body), so
+    // it always spans the full card width, independent of the actions column
+    if (!wrap) return;
+    const body = wrap.querySelector(".body");
+    if (!body) return;
+    this._expandedUri = ep.uri;
+    wrap.classList.add("expanded");
+    const panel = this._el("div", "desc-panel");
+    wrap.appendChild(panel);
+    const cached = this._descCache.get(ep.uri);
+    if (cached === undefined) {
+      this._fetchDesc(ep, panel);
+    } else {
+      this._fillDesc(ep, panel, cached);
+    }
+  }
+
+  _fetchDesc(ep, panel) {
+    if (this._descLoading.has(ep.uri)) return;
+    this._descLoading.add(ep.uri);
+    panel.textContent = this._isHu() ? "Betöltés…" : "Loading…";
+    const url = "/api/music_assistant_podcasts/description";
+    const body = JSON.stringify({ uris: [ep.uri] });
+    const req = this._hass.fetchWithAuth
+      ? this._hass.fetchWithAuth(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        })
+      : fetch(url, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+    req
+      .then((res) =>
+        res.ok ? res.json() : Promise.reject(new Error(String(res.status)))
+      )
+      .then((data) => {
+        const desc = data && ep.uri in data ? data[ep.uri] : null;
+        this._descCache.set(ep.uri, desc);
+        if (this._expandedUri === ep.uri && panel.isConnected) {
+          this._fillDesc(ep, panel, desc);
+        }
+      })
+      .catch(() => {
+        if (this._expandedUri !== ep.uri || !panel.isConnected) return;
+        panel.textContent = this._isHu()
+          ? "Nem sikerült betölteni — kattints az újrakezdéshez."
+          : "Failed to load — click to retry.";
+        panel.classList.add("desc-error");
+        panel.onclick = () => {
+          panel.classList.remove("desc-error");
+          panel.onclick = null;
+          this._fetchDesc(ep, panel);
+        };
+      })
+      .finally(() => this._descLoading.delete(ep.uri));
+  }
+
+  _fillDesc(ep, panel, desc) {
+    // first line: the episode title (bold), then a blank line, then text
+    panel.textContent = "";
+    panel.appendChild(this._el("div", "desc-title", ep.title || ""));
+    const text =
+      this._descriptionText(desc) ||
+      (this._isHu()
+        ? "Nincs leírás ehhez az epizódhoz."
+        : "No description for this episode.");
+    panel.appendChild(this._el("div", "desc-body", text));
+  }
+
+  _descriptionText(raw) {
+    // Provider descriptions often contain HTML. Render them as plain text:
+    // strip scripts/styles entirely, keep line structure via block elements.
+    if (!raw) return "";
+    const doc = new DOMParser().parseFromString(String(raw), "text/html");
+    for (const node of doc.querySelectorAll("script, style, iframe, object, embed")) {
+      node.remove();
+    }
+    const lines = [];
+    const BLOCK = /^(P|DIV|BR|LI|UL|OL|H[1-6]|BLOCKQUOTE|TR|PRE)$/;
+    const walk = (node) => {
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          lines.push(child.textContent);
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          if (child.tagName === "BR") {
+            lines.push("\n");
+            continue;
+          }
+          if (BLOCK.test(child.tagName) && lines.length) lines.push("\n");
+          walk(child);
+          if (BLOCK.test(child.tagName)) lines.push("\n");
+        }
+      }
+    };
+    walk(doc.body);
+    return lines.join("").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  // ---- play feedback toast -------------------------------------------------
+
+  _showPlayToast(row) {
+    if (!row) return;
+    const old = row.querySelector(".play-toast");
+    if (old) old.remove();
+    const toast = this._el(
+      "div",
+      "play-toast",
+      this._isHu() ? "Podcast indítása" : "Starting playback"
+    );
+    toast.addEventListener("animationend", () => toast.remove());
+    row.appendChild(toast);
+  }
+
+  // ---- rendering helpers ---------------------------------------------------
 
   _el(tag, className, text) {
     const el = document.createElement(tag);
@@ -359,7 +653,8 @@ class MapodcastsEpisodesCard extends HTMLElement {
       s.title = text;
       s.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        this._play(ep);
+        // title click toggles the description panel (not playback)
+        this._toggleDesc(ep, ev.target.closest(".row-wrap"));
       });
       return s;
     };
@@ -385,7 +680,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
       s.title = ep.title || "";
       s.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        this._play(ep);
+        this._toggleDesc(ep, ev.target.closest(".row-wrap"));
       });
       inner.appendChild(s);
       inner.classList.add("overflowing");
@@ -398,9 +693,15 @@ class MapodcastsEpisodesCard extends HTMLElement {
   }
 
   _buildRow(ep) {
+    // wrapper holds the .row and (when open) the full-width description
+    // panel, so the panel width never depends on the actions column
+    const rowWrap = this._el("div", "row-wrap");
     const row = this._el("div", "row");
 
-    // cover image with hover play overlay
+    // left column: cover on top (rows are top-aligned), and in the expanded
+    // state a dedicated play button under the cover (the overlay itself is
+    // hidden while expanded)
+    const imgCol = this._el("div", "img-col");
     const imgWrap = this._el("div", "img-wrap");
     const img = document.createElement("img");
     img.alt = "";
@@ -409,9 +710,17 @@ class MapodcastsEpisodesCard extends HTMLElement {
     const overlay = this._el("div", "img-overlay");
     overlay.appendChild(this._haIcon("mdi:play-circle", "overlay-play"));
     overlay.title = "Play";
-    overlay.addEventListener("click", () => this._play(ep));
+    overlay.addEventListener("click", () => this._play(ep, row));
     imgWrap.appendChild(overlay);
-    row.appendChild(imgWrap);
+    imgCol.appendChild(imgWrap);
+    const playBtn = document.createElement("button");
+    playBtn.type = "button";
+    playBtn.className = "play-btn";
+    playBtn.title = "Play";
+    playBtn.appendChild(this._haIcon("mdi:play-circle", null));
+    playBtn.addEventListener("click", () => this._play(ep, row));
+    imgCol.appendChild(playBtn);
+    row.appendChild(imgCol);
     this._loadImage(ep.image, img);
 
     const body = this._el("div", "body");
@@ -461,14 +770,22 @@ class MapodcastsEpisodesCard extends HTMLElement {
     body.appendChild(barWrap);
     row.appendChild(body);
 
-    // actions: only the played marker
+    // actions: played marker first, then the description chevron
     const actions = this._el("div", "actions");
     const played = this._haIcon("mdi:check-circle", "played");
     played.style.display = "none";
     actions.appendChild(played);
+    const chev = this._haIcon("mdi:chevron-down", "chev");
+    chev.title = this._isHu() ? "Leírás" : "Description";
+    chev.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      this._toggleDesc(ep, rowWrap);
+    });
+    actions.appendChild(chev);
     row.appendChild(actions);
 
-    return row;
+    rowWrap.appendChild(row);
+    return rowWrap;
   }
 
   _buildStyles() {
@@ -507,12 +824,58 @@ class MapodcastsEpisodesCard extends HTMLElement {
         border-color: currentColor;
       }
       .header .fav-btn .fav-star { --mdc-icon-size: 18px; }
+      .row-wrap {
+        border-top: 1px solid var(--divider-color, #333);
+      }
+      .row-wrap.expanded .play-btn {
+        display: flex; align-items: center; justify-content: center;
+      }
       .row {
-        display: flex; align-items: center; gap: 12px;
-        padding: 8px 0; border-top: 1px solid var(--divider-color, #333);
+        position: relative;   /* anchor for the play toast */
+        display: flex; align-items: flex-start;   /* cover stays at the top */
+        gap: 12px;
+        padding: 8px 0;
+      }
+      .img-col {
+        flex: 0 0 48px;
+        position: relative;   /* anchor for the floating play button */
+      }
+      .play-btn {
+        /* absolutely positioned so it does NOT grow the row height — the
+           description panel below the row then starts right under the text */
+        display: none; position: absolute; top: 54px; left: 50%;
+        transform: translateX(-50%);
+        padding: 0; border: none; background: transparent;
+        color: var(--primary-color, #03a9f4); cursor: pointer;
+        --mdc-icon-size: 28px;
+        transition: color 0.15s ease, transform 0.15s ease;
+      }
+      .play-btn:hover {
+        color: var(--state-active-color, var(--primary-color, #03a9f4));
+        transform: translateX(-50%) scale(1.12);
+        filter: drop-shadow(0 0 4px var(--primary-color, #03a9f4));
+      }
+      .play-btn:active { transform: translateX(-50%) scale(0.95); }
+      .row.expanded .play-btn {
+        display: flex; align-items: center; justify-content: center;
+      }
+      .play-toast {
+        position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--primary-color, #03a9f4); color: #fff;
+        padding: 6px 14px; border-radius: 16px;
+        font-size: 0.85em; white-space: nowrap;
+        pointer-events: none; z-index: 5;
+        animation: play-toast 1.5s ease forwards;
+      }
+      @keyframes play-toast {
+        0% { opacity: 0; }
+        12% { opacity: 1; }
+        80% { opacity: 1; }
+        100% { opacity: 0; }
       }
       .img-wrap {
-        width: 48px; height: 48px; flex: 0 0 48px;
+        width: 48px; height: 48px;
         position: relative;
       }
       .img-wrap img {
@@ -527,6 +890,9 @@ class MapodcastsEpisodesCard extends HTMLElement {
         opacity: 0; transition: opacity 0.15s ease; cursor: pointer;
       }
       .row:hover .img-overlay { opacity: 1; }
+      /* while the description is open, play lives on the button under the
+         cover — the overlay trigger is switched off */
+      .row-wrap.expanded .img-overlay { display: none; }
       .img-overlay .overlay-play { color: #fff; --mdc-icon-size: 28px; }
       .body { flex: 1; min-width: 0; }
 
@@ -578,7 +944,31 @@ class MapodcastsEpisodesCard extends HTMLElement {
         display: flex; align-items: center; flex-shrink: 0;
         color: var(--secondary-text-color);
       }
+      .actions .chev {
+        cursor: pointer;
+        transition: transform 0.2s ease;
+      }
+      .row-wrap.expanded .actions .chev { transform: rotate(180deg); }
       .actions .played { color: var(--success-color, green); }
+
+      /* expandable episode description: a child of .row-wrap so its right
+         edge always reaches the card wall; the left margin keeps it aligned
+         with the body column (cover 48px + row gap 12px) */
+      .desc-panel {
+        margin-left: 60px;
+        padding: 0 0 12px;
+        max-height: ${DESC_PANEL_MAX_HEIGHT}px; overflow-y: auto;
+        font-size: 0.95em; line-height: 1.5;
+        color: var(--primary-text-color);
+        overflow-wrap: anywhere;
+        border-radius: 6px;
+      }
+      .desc-title {
+        font-weight: 600;
+        margin-bottom: 10px;
+      }
+      .desc-body { white-space: pre-wrap; }
+      .desc-panel.desc-error { cursor: pointer; }
       .empty { color: var(--secondary-text-color); padding: 12px 0; }
     `;
   }
@@ -593,13 +983,16 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
   _render() {
     const episodes = this._episodes();
-    const signature = JSON.stringify([episodes, this._config]);
-    if (signature !== this._lastSignature) {
-      this._lastSignature = signature;
-      this._rebuild(episodes);
-    } else {
+    // volatile play-state fields must not trigger a full rebuild (they change
+    // on every play-state update); row-level updates handle those in place
+    const stable = episodes.map(({ position: _position, state: _state, ...rest }) => rest);
+    const signature = JSON.stringify([stable, this._config, this._favOnly]);
+    if (signature === this._lastSignature) {
       this._applyProgress();
+      return;
     }
+    this._lastSignature = signature;
+    this._rebuild(episodes);
   }
 
   _rebuild(episodes) {
@@ -641,7 +1034,13 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
     if (episodes.length) {
       for (const ep of episodes) {
-        card.appendChild(this._buildRow(ep));
+        const row = this._buildRow(ep);
+        card.appendChild(row);
+        if (ep.uri === this._expandedUri) {
+          // a rebuild (new data) happened while a description was open —
+          // re-open it so the panel survives the refresh
+          this._openDesc(ep, row);
+        }
       }
     } else {
       const loading =
@@ -662,6 +1061,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
   disconnectedCallback() {
     this._stopPolling();
+    this._descLoading.clear();
     if (this._raf) {
       cancelAnimationFrame(this._raf);
       this._raf = null;
