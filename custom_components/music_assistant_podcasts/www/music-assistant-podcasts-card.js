@@ -8,6 +8,7 @@
  *   type: custom:music-assistant-podcasts-card
  *   entity: sensor.latest_podcast_episodes   # (optional, auto-detected)
  *   player: media_player.x                   # (optional, overrides the integration default)
+ *   playback_control: true                   # (default) seek buttons (-30/-10/+10/+30 s) under the header
  *   title: Legfrissebb epizódok
  *   max_items: 20
  *   show_played: true
@@ -100,6 +101,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
     this._descCache = new Map(); // episode uri -> description (string|null)
     this._descLoading = new Set();
     this._expandedUri = null; // currently open description panel
+    this._seekStrip = null; // header seek control (created in _rebuild)
     this._optimistic = new Map(); // episode uri -> grace deadline (ms epoch)
     this._lastPollAt = 0; // ms epoch of the last successful progress poll
     this._lastPlayed = null; // uri of the episode last started from this card
@@ -116,6 +118,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
       title: config.title || "Latest episodes",
       max_items: Number(config.max_items) || 20,
       show_played: config.show_played !== false,
+      playback_control: config.playback_control !== false,
     };
     this._lastSignature = null; // force rebuild
     this._render();
@@ -260,6 +263,97 @@ class MapodcastsEpisodesCard extends HTMLElement {
     if (live !== null) return live;
     const cached = this._progress.get(ep.uri);
     return cached ? cached.position : ep.position || 0;
+  }
+
+  // ---- playback control (seek strip) ----------------------------------------
+
+  // The seek strip targets the active media_player entity — whatever it is
+  // currently playing (podcast, music, radio, TTS, …). The explicit card
+  // config wins; otherwise any playing/paused media_player is used, with the
+  // Music Assistant player preferred among them.
+  _seekPlayerId() {
+    if (this._config.player && this._hass?.states?.[this._config.player]) {
+      return this._config.player;
+    }
+    const states = this._hass?.states || {};
+    const active = Object.keys(states).filter(
+      (id) =>
+        id.startsWith("media_player.") &&
+        (states[id]?.state === "playing" || states[id]?.state === "paused")
+    );
+    const ma = active.find(
+      (id) => states[id]?.attributes?.device_class === "music_assistant"
+    );
+    return ma || active[0] || null;
+  }
+
+  // Interpolated live position + duration of the active player.
+  _seekInfo() {
+    const id = this._seekPlayerId();
+    const st = id ? this._hass?.states?.[id] : null;
+    if (!st) return null;
+    const attrs = st.attributes || {};
+    const base = Number(attrs.media_position) || 0;
+    const updated = attrs.media_position_updated_at
+      ? new Date(attrs.media_position_updated_at).getTime()
+      : null;
+    let pos =
+      base + (updated && !Number.isNaN(updated) ? (Date.now() - updated) / 1000 : 0);
+    const dur = Number(attrs.media_duration) || 0;
+    if (dur > 0) pos = Math.min(pos, dur);
+    return { pos: Math.max(0, pos), dur };
+  }
+
+  _seek(offsetSec) {
+    const id = this._seekPlayerId();
+    const info = this._seekInfo();
+    if (!id || !info) return;
+    let target = info.pos + offsetSec;
+    if (info.dur > 0) target = Math.min(target, info.dur);
+    target = Math.max(0, Math.round(target));
+    this._hass.callService("media_player", "media_seek", {
+      entity_id: id,
+      seek_position: target,
+    });
+  }
+
+  // Shown only while the active player has media loaded (playing/paused);
+  // hidden when there is no playback at all.
+  _updateSeekStrip() {
+    const strip = this._seekStrip;
+    if (!strip) return;
+    const id = this._seekPlayerId();
+    const st = id ? this._hass?.states?.[id] : null;
+    const active =
+      !!st &&
+      (st.state === "playing" || st.state === "paused") &&
+      st.attributes &&
+      st.attributes.media_position !== undefined;
+    strip.style.display = active ? "flex" : "none";
+  }
+
+  _buildSeekStrip() {
+    const strip = this._el("div", "seek-strip");
+    strip.style.display = "none";
+    const hu = this._isHu();
+    const buttons = [
+      { off: -30, icon: "mdi:rewind", label: hu ? "-30 mp" : "-30 s" },
+      { off: -10, icon: "mdi:rewind-10", label: hu ? "-10 mp" : "-10 s" },
+      { off: 10, icon: "mdi:fast-forward-10", label: hu ? "+10 mp" : "+10 s" },
+      { off: 30, icon: "mdi:fast-forward", label: hu ? "+30 mp" : "+30 s" },
+    ];
+    for (const b of buttons) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "seek-btn";
+      btn.title = b.label;
+      btn.appendChild(this._haIcon(b.icon, "seek-ico"));
+      btn.appendChild(this._el("span", "seek-label", b.label));
+      btn.addEventListener("click", () => this._seek(b.off));
+      strip.appendChild(btn);
+    }
+    this._seekStrip = strip;
+    return strip;
   }
 
   _maUrl() {
@@ -824,6 +918,35 @@ class MapodcastsEpisodesCard extends HTMLElement {
         border-color: currentColor;
       }
       .header .fav-btn .fav-star { --mdc-icon-size: 18px; }
+      .seek-strip {
+        display: none; align-items: center; gap: 8px;
+        margin-top: 10px;          /* extra space below the header */
+        padding-top: 10px;
+        border-top: 1px solid var(--divider-color, #333); /* same as row separators */
+        margin-bottom: 10px;
+      }
+      .seek-btn {
+        flex: 1; display: flex; align-items: center; justify-content: center;
+        gap: 4px; padding: 6px 4px; border-radius: 16px;
+        border: none;
+        /* slightly darker than the card */
+        background: rgba(0, 0, 0, 0.07); /* fallback */
+        background: color-mix(in srgb,
+          var(--card-background-color, #fff) 93%,
+          var(--primary-text-color, #000));
+        color: var(--primary-text-color);
+        font-size: 0.85em; cursor: pointer; white-space: nowrap;
+        transition: color 0.15s ease, background 0.15s ease,
+          transform 0.1s ease;
+      }
+      .seek-btn:hover {
+        color: var(--primary-color, #03a9f4);
+        background: color-mix(in srgb,
+          var(--card-background-color, #fff) 86%,
+          var(--primary-text-color, #000));
+      }
+      .seek-btn:active { transform: scale(0.95); }
+      .seek-btn .seek-ico { --mdc-icon-size: 16px; }
       .row-wrap {
         border-top: 1px solid var(--divider-color, #333);
       }
@@ -989,6 +1112,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
     const signature = JSON.stringify([stable, this._config, this._favOnly]);
     if (signature === this._lastSignature) {
       this._applyProgress();
+      this._updateSeekStrip();
       return;
     }
     this._lastSignature = signature;
@@ -1032,6 +1156,10 @@ class MapodcastsEpisodesCard extends HTMLElement {
     header.appendChild(refreshBtn);
     card.appendChild(header);
 
+    // playback control strip (below the header, above the first row); the
+    // visible/hidden state is refreshed on every hass tick
+    if (this._config.playback_control) card.appendChild(this._buildSeekStrip());
+
     if (episodes.length) {
       for (const ep of episodes) {
         const row = this._buildRow(ep);
@@ -1050,6 +1178,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
     root.appendChild(card);
     this._applyProgress();
+    this._updateSeekStrip();
     // measure after layout so the marquee only activates on real overflow
     requestAnimationFrame(() => this._checkOverflow());
   }
@@ -1209,6 +1338,19 @@ class MapodcastsEpisodesEditor extends HTMLElement {
     checkWrap.appendChild(lbl);
     root.appendChild(checkWrap);
     this._refs.showPlayed = showPlayed;
+
+    const seekWrap = this._el("div", "check");
+    const seekCtl = this._el("input");
+    seekCtl.type = "checkbox";
+    seekCtl.addEventListener("change", () =>
+      this._emit({ ...this._config, playback_control: seekCtl.checked })
+    );
+    const seekLbl = this._el("label", null, "Playback control (seek buttons)");
+    seekLbl.htmlFor = seekCtl.id = "f-playback-control";
+    seekWrap.appendChild(seekCtl);
+    seekWrap.appendChild(seekLbl);
+    root.appendChild(seekWrap);
+    this._refs.playbackControl = seekCtl;
   }
 
   _syncFields() {
@@ -1229,6 +1371,7 @@ class MapodcastsEpisodesEditor extends HTMLElement {
     setIfIdle(this._refs.player, cfg.player ?? "");
     setIfIdle(this._refs.maxItems, cfg.max_items ?? 20);
     setIfIdle(this._refs.showPlayed, cfg.show_played !== false);
+    setIfIdle(this._refs.playbackControl, cfg.playback_control !== false);
   }
 
   _el(tag, className, text) {

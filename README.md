@@ -20,6 +20,9 @@ library into a single Home Assistant sensor, with a custom dashboard card.
   entity in real time; play states sync through a lightweight coordinator
   (fast while playing, slow otherwise) plus on-demand polling of the last
   started episode
+- Playback control (default on): four seek buttons (-30/-10/+10/+30 s) on a
+  strip between the header and the list — they seek the active media_player,
+  whatever it is playing (not just podcasts); hidden when nothing is playing
 - Podcast name links to the podcast page in the Music Assistant web UI
 - Seamless marquee on overflowing episode titles (hover only)
 - Favourite shows
@@ -58,6 +61,7 @@ library into a single Home Assistant sensor, with a custom dashboard card.
 type: custom:music-assistant-podcasts-card
 player: media_player.my_player   # playback target (overrides the integration default)
 max_items: 20                    # rows shown
+playback_control: true           # seek buttons under the header (default on)
 ```
 
 ### Integration options
