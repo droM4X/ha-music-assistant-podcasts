@@ -7,17 +7,33 @@
  * YAML config (or use the built-in editor via the card picker):
  *   type: custom:music-assistant-podcasts-card
  *   entity: sensor.latest_podcast_episodes   # (optional, auto-detected)
+ *   saved_entity: sensor.saved_podcast_episodes  # (optional, auto-detected)
  *   player: media_player.x                   # (optional, overrides the integration default)
  *   playback_control: true                   # (default) seek buttons (-30/-10/+10/+30 s) under the header
  *   title: Legfrissebb epizódok
  *   max_items: 20
  *   show_played: true
+ *   show_saved: true                         # (default) saved-episodes switch in the header
+ *
+ * The header holds a 3-way switch that shows exactly ONE list at a time:
+ *   "all"       — the fresh episode list (show_played applies)
+ *   "favorites" — the same list, only podcasts flagged favourite in Music
+ *                 Assistant (show_played applies)
+ *   "saved"     — the locally stored "save for later" episodes, untouched
+ *                 by show_played (whatever you saved, stays)
  *
  * Layout per row:
  *   row 1 (info):  podcast name · published · length · "még X perc"
  *   row 2:         episode title (click = toggles a scrollable description
  *                  panel under the row, one open at a time; seamless marquee
  *                  on hover when it does not fit)
+ *
+ * While a row is expanded, its first column stacks three buttons below the
+ * cover with no gap between them: play · favourite (podcast level, stored by
+ * Music Assistant) · save-for-later (episode level, stored by this card in a
+ * Home Assistant storage collection). The save button doubles as "unsave":
+ * once an episode is stored it shows a filled bookmark and clicking removes
+ * it again.
  *
  * Extras: the cover image is the play trigger (hover overlay; on touch a
  * tap starts playback) with a short "starting playback" toast on the row;
@@ -37,6 +53,15 @@ const PROGRESS_BURST_DELAYS_MS = [2000, 6000, 12000];
 const PLAY_GRACE_MS = 45000;
 // description panel: natural height up to this, then internal scrolling
 const DESC_PANEL_MAX_HEIGHT = 300;
+// The three lists the header switch can show. Exactly one is rendered.
+const VIEW_ALL = "all";
+const VIEW_FAVORITES = "favorites";
+const VIEW_SAVED = "saved";
+// Icons reused by both the header switch and the per-row buttons.
+const ICON_FAV_OFF = "mdi:star-outline";
+const ICON_FAV_ON = "mdi:star";
+const ICON_SAVE_OFF = "mdi:bookmark-plus-outline";
+const ICON_SAVE_ON = "mdi:bookmark";
 
 // Sample rows shown when no sensor entity is configured (card picker preview)
 const DEMO_EPISODES = [
@@ -105,7 +130,12 @@ class MapodcastsEpisodesCard extends HTMLElement {
     this._optimistic = new Map(); // episode uri -> grace deadline (ms epoch)
     this._lastPollAt = 0; // ms epoch of the last successful progress poll
     this._lastPlayed = null; // uri of the episode last started from this card
-    this._favOnly = false;
+    // which single list the header switch currently shows
+    this._view = VIEW_ALL;
+    // optimistic overrides, applied until the server-confirmed state
+    // arrives via the sensor attributes (podcast_uri -> bool | uri -> true)
+    this._favOverride = new Map();
+    this._savedOverride = new Set();
   }
 
   setConfig(config) {
@@ -114,10 +144,12 @@ class MapodcastsEpisodesCard extends HTMLElement {
     }
     this._config = {
       entity: config.entity || null,
+      saved_entity: config.saved_entity || null,
       player: config.player || null,
       title: config.title || "Latest episodes",
       max_items: Number(config.max_items) || 20,
       show_played: config.show_played !== false,
+      show_saved: config.show_saved !== false,
       playback_control: config.playback_control !== false,
     };
     this._lastSignature = null; // force rebuild
@@ -127,15 +159,32 @@ class MapodcastsEpisodesCard extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     if (!this._config.entity) {
-      const found = Object.keys(hass.states).find((id) => {
-        const attrs = hass.states[id]?.attributes;
-        return (
-          id.startsWith("sensor.") && attrs && Array.isArray(attrs.episodes)
-        );
-      });
+      const found = this._findEpisodesSensor();
       if (found) this._config.entity = found;
     }
+    if (!this._config.saved_entity) {
+      const saved = this._findEpisodesSensor(true);
+      if (saved) this._config.saved_entity = saved;
+    }
     this._scheduleRender();
+  }
+
+  // The card shows one list at a time, so it needs to find BOTH episode
+  // sensors. The saved one advertises itself with `saved: true` rather than
+  // relying on a generated entity id, which depends on the device/entity
+  // naming and would break on rename.
+  _findEpisodesSensor(savedOnly = false) {
+    const states = this._hass?.states || {};
+    const match = (id) => {
+      const attrs = states[id]?.attributes;
+      if (!attrs || !Array.isArray(attrs.episodes)) return false;
+      return savedOnly ? attrs.saved === true : attrs.saved !== true;
+    };
+    return (
+      Object.keys(states).find(
+        (id) => id.startsWith("sensor.") && match(id)
+      ) || null
+    );
   }
 
   getCardSize() {
@@ -143,12 +192,20 @@ class MapodcastsEpisodesCard extends HTMLElement {
   }
 
   static getStubConfig(hass) {
-    const sensor = Object.keys(hass?.states || {}).find((id) => {
-      const attrs = hass.states[id]?.attributes;
-      return id.startsWith("sensor.") && attrs && Array.isArray(attrs.episodes);
-    });
+    const pick = (savedOnly) => {
+      const states = hass?.states || {};
+      return (
+        Object.keys(states).find((id) => {
+          const attrs = states[id]?.attributes;
+          if (!id.startsWith("sensor.") || !attrs) return false;
+          if (!Array.isArray(attrs.episodes)) return false;
+          return savedOnly ? attrs.saved === true : attrs.saved !== true;
+        }) || undefined
+      );
+    };
     return {
-      entity: sensor || undefined,
+      entity: pick(false),
+      saved_entity: pick(true),
       title: "Latest episodes",
       max_items: 20,
     };
@@ -160,22 +217,72 @@ class MapodcastsEpisodesCard extends HTMLElement {
 
   // ---- data helpers ------------------------------------------------------
 
+  // The saved list is served by its own sensor, so a saved episode looks
+  // exactly like a fetched one. Rows coming from it carry `saved_at`, which
+  // is how they are recognised further down (they have a stored description
+  // and a stored favourite snapshot instead of live MA data).
+  _isSavedRow(ep) {
+    return Boolean(ep && ep.saved_at);
+  }
+
+  _rawEpisodes() {
+    const entity =
+      this._view === VIEW_SAVED ? this._config.saved_entity : this._config.entity;
+    const attrs = this._hass?.states?.[entity]?.attributes;
+    return attrs && Array.isArray(attrs.episodes) ? attrs.episodes : [];
+  }
+
   _episodes() {
-    const attrs = this._hass?.states?.[this._config.entity]?.attributes;
-    let eps =
-      attrs && Array.isArray(attrs.episodes) ? attrs.episodes : [];
-    if (!this._config.show_played) {
+    let eps = this._rawEpisodes();
+    if (this._view === VIEW_FAVORITES) {
+      eps = eps.filter((ep) => this._effectiveFav(ep));
+    } else if (this._view !== VIEW_SAVED && !this._config.show_played) {
+      // "saved" is deliberately NOT filtered by show_played: whatever the
+      // user explicitly saved should still be there.
       eps = eps.filter((ep) => this._stateOf(ep) !== "finished");
     }
-    if (this._favOnly) {
-      eps = eps.filter((ep) => !!ep.podcast_fav);
-    }
     if (eps.length) return eps.slice(0, this._config.max_items);
+    if (this._view === VIEW_SAVED) {
+      // an empty saved list is a real state, not a "no sensor configured"
+      // fallback to the demo rows
+      return [];
+    }
     // no entity configured (e.g. card picker preview) → demo rows
     if (!this._config.entity) {
       return DEMO_EPISODES.slice(0, this._config.max_items);
     }
     return [];
+  }
+
+  // Favourite flag of a row, with the optimistic override applied. The
+  // override covers the gap between the click and the refreshed sensor
+  // (and keeps a saved row consistent with the live one).
+  _effectiveFav(ep) {
+    const uri = ep && ep.podcast_uri;
+    if (uri && this._favOverride.has(uri)) return this._favOverride.get(uri);
+    return Boolean(ep && ep.podcast_fav);
+  }
+
+  _effectiveSaved(ep) {
+    if (!ep) return false;
+    if (this._savedOverride.has(ep.uri)) return true;
+    return this._isSavedRow(ep);
+  }
+
+  // Drop overrides the server has caught up with, so a later MA-side change
+  // (e.g. favouriting in the MA web UI) wins again.
+  _pruneOverrides() {
+    const live = this._rawEpisodes();
+    for (const [uri, value] of this._favOverride) {
+      const row = live.find((ep) => ep.podcast_uri === uri);
+      if (row && Boolean(row.podcast_fav) === value) this._favOverride.delete(uri);
+    }
+    const savedUris = new Set(
+      live.filter((ep) => this._isSavedRow(ep)).map((ep) => ep.uri)
+    );
+    for (const uri of this._savedOverride) {
+      if (savedUris.has(uri)) this._savedOverride.delete(uri);
+    }
   }
 
   _stateOf(ep) {
@@ -369,6 +476,11 @@ class MapodcastsEpisodesCard extends HTMLElement {
     return this._lang().toLowerCase().startsWith("hu");
   }
 
+  // Pick the Hungarian or English wording of a card label.
+  _pick(hu, en) {
+    return this._isHu() ? hu : en;
+  }
+
   _relativeDate(iso) {
     if (!iso) return "";
     const date = new Date(iso);
@@ -391,13 +503,13 @@ class MapodcastsEpisodesCard extends HTMLElement {
   _durationLabel(sec) {
     if (!sec) return "";
     const mins = Math.max(1, Math.round(sec / 60));
-    const unit = this._isHu() ? "perc" : "min";
+    const unit = this._pick("perc", "min");
     return `${mins} ${unit}`;
   }
 
   _remainingLabel(sec) {
     const mins = Math.max(1, Math.round(sec / 60));
-    return this._isHu() ? `még ${mins} perc` : `${mins} min left`;
+    return this._pick(`még ${mins} perc`, `${mins} min left`);
   }
 
   _podcastUrl(ep) {
@@ -459,6 +571,133 @@ class MapodcastsEpisodesCard extends HTMLElement {
     this._hass.callService("music_assistant_podcasts", "refresh", {});
   }
 
+  // ---- authenticated HTTP helper -----------------------------------------
+
+  // All calls to this integration's own /api endpoints go through here, so
+  // the auth handling and the JSON plumbing live in exactly one place.
+  async _apiFetch(path, method, body) {
+    const init = method === "DELETE" ? { method } : { method: method || "POST" };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+    const url = `/api/music_assistant_podcasts${path}`;
+    const res = this._hass.fetchWithAuth
+      ? await this._hass.fetchWithAuth(url, init)
+      : await fetch(url, { ...init, credentials: "include" });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.json())?.error || "";
+      } catch {
+        // body was not json — the status alone has to do
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    // 204/empty bodies are fine (none of our endpoints use them today)
+    if (res.status === 204) return null;
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  // ---- favourites & saved episodes ----------------------------------------
+
+  // Favourite is stored BY MUSIC ASSISTANT (so it shows up in the MA web UI
+  // too), the card just drives it through the authenticated endpoint. The
+  // icon flips immediately and is reverted if MA refuses (some providers
+  // cannot favourite an item at all).
+  async _toggleFavorite(ep) {
+    const uri = ep.podcast_uri;
+    if (!uri) {
+      this._toast(this._pick("Ismeretlen műsor", "Unknown podcast"));
+      return;
+    }
+    const next = !this._effectiveFav(ep);
+    this._favOverride.set(uri, next);
+    this._lastSignature = null;
+    this._render();
+    try {
+      await this._apiFetch("/favorite", "POST", {
+        podcast_uri: uri,
+        podcast_item_id: ep.podcast_item_id ?? null,
+        favorite: next,
+      });
+    } catch (err) {
+      this._favOverride.delete(uri);
+      this._lastSignature = null;
+      this._render();
+      this._toast(
+        this._isHu()
+          ? "Nem sikerült a kedvencjelölés eltávolítása"
+          : "Could not update the favourite",
+        err
+      );
+    }
+  }
+
+  // Saved ("for later") episodes live ONLY in this integration's storage:
+  // Music Assistant has no favourite-episode concept. A saved row shows a
+  // filled bookmark and clicking it again deletes the stored copy.
+  async _toggleSaved(ep) {
+    const alreadySaved = this._effectiveSaved(ep);
+    if (alreadySaved) {
+      this._savedOverride.delete(ep.uri);
+    } else {
+      this._savedOverride.add(ep.uri);
+    }
+    this._lastSignature = null;
+    this._render();
+    try {
+      if (alreadySaved) {
+        await this._apiFetch("/saved_episodes", "DELETE", { uri: ep.uri });
+        this._toast(
+          this._pick("Eltávolítva a mentettek közül", "Removed from saved")
+        );
+      } else {
+        // the description panel is open while this button is reachable, so
+        // its text is already in the client cache — pass it along to make
+        // the saved episode self-contained
+        const cached = this._descCache.get(ep.uri);
+        await this._apiFetch("/saved_episodes", "POST", {
+          episode: { ...ep, description: cached === undefined ? null : cached },
+        });
+        this._toast(
+          this._pick(
+            "Elmentve — megjelenik a Mentettek listában",
+            "Saved for later"
+          )
+        );
+      }
+    } catch (err) {
+      if (alreadySaved) this._savedOverride.add(ep.uri);
+      else this._savedOverride.delete(ep.uri);
+      this._lastSignature = null;
+      this._render();
+      this._toast(
+        this._pick("Nem sikerült elmenteni", "Could not save the episode"),
+        err
+      );
+    }
+  }
+
+  // Small, unobtrusive feedback for the row-level actions. Unlike the play
+  // toast this one stays put, because a failed save must be readable.
+  _toast(text, err) {
+    const el = this._el("div", "info-toast", text);
+    if (err) {
+      el.classList.add("error");
+      const detail = String(err && err.message ? err.message : err);
+      if (detail) el.title = detail;
+    }
+    this.shadowRoot.appendChild(el);
+    const remove = () => el.remove();
+    el.addEventListener("animationend", remove);
+    setTimeout(remove, 2600);
+  }
+
   // ---- live progress polling ----------------------------------------------
 
   _anyInProgress() {
@@ -518,26 +757,13 @@ class MapodcastsEpisodesCard extends HTMLElement {
     const active = this._activeUri();
     if (!active) return; // nothing playing — sensor states cover the rest
     try {
-      const res = this._hass.fetchWithAuth
-        ? await this._hass.fetchWithAuth(
-            "/api/music_assistant_podcasts/progress",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ uris: [active] }),
-            }
-          )
-        : await fetch("/api/music_assistant_podcasts/progress", {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ uris: [active] }),
-          });
-      if (!res.ok) return; // keep the cached states on transient errors
-      const data = await res.json();
+      const data = await this._apiFetch("/progress", "POST", { uris: [active] });
+      if (!data) return;
       this._lastPollAt = Date.now();
       // merge instead of replacing: rows other than the active one keep
-      // their last known state
+      // their last known state. A saved episode Music Assistant no longer
+      // knows about is simply absent from the answer, so its stored
+      // position/state snapshot survives untouched.
       this._progress = new Map([...this._progress, ...Object.entries(data || {})]);
       this._applyProgress();
     } catch {
@@ -604,8 +830,6 @@ class MapodcastsEpisodesCard extends HTMLElement {
     // the panel is a child of the row wrapper (not of the flex .body), so
     // it always spans the full card width, independent of the actions column
     if (!wrap) return;
-    const body = wrap.querySelector(".body");
-    if (!body) return;
     this._expandedUri = ep.uri;
     wrap.classList.add("expanded");
     const panel = this._el("div", "desc-panel");
@@ -621,25 +845,12 @@ class MapodcastsEpisodesCard extends HTMLElement {
   _fetchDesc(ep, panel) {
     if (this._descLoading.has(ep.uri)) return;
     this._descLoading.add(ep.uri);
-    panel.textContent = this._isHu() ? "Betöltés…" : "Loading…";
-    const url = "/api/music_assistant_podcasts/description";
-    const body = JSON.stringify({ uris: [ep.uri] });
-    const req = this._hass.fetchWithAuth
-      ? this._hass.fetchWithAuth(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-        })
-      : fetch(url, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body,
-        });
-    req
-      .then((res) =>
-        res.ok ? res.json() : Promise.reject(new Error(String(res.status)))
-      )
+    panel.textContent = this._pick("Betöltés…", "Loading…");
+    // A saved episode keeps its own copy of the description in the local
+    // store, so it is read from there — that way it stays readable even if
+    // Music Assistant has since forgotten the episode.
+    const path = this._isSavedRow(ep) ? "/saved_description" : "/description";
+    this._apiFetch(path, "POST", { uris: [ep.uri] })
       .then((data) => {
         const desc = data && ep.uri in data ? data[ep.uri] : null;
         this._descCache.set(ep.uri, desc);
@@ -712,7 +923,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
     const toast = this._el(
       "div",
       "play-toast",
-      this._isHu() ? "Podcast indítása" : "Starting playback"
+      this._pick("Podcast indítása", "Starting playback")
     );
     toast.addEventListener("animationend", () => toast.remove());
     row.appendChild(toast);
@@ -741,20 +952,23 @@ class MapodcastsEpisodesCard extends HTMLElement {
     // translateX(-50%) loop is seamless and never jumps back to the start.
     const wrap = this._el("div", "title-wrap");
     const inner = this._el("div", "title-inner");
-    const text = ep.title || "";
-    const makeCopy = () => {
-      const s = this._el("span", "title-text", text);
-      s.title = text;
-      s.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        // title click toggles the description panel (not playback)
-        this._toggleDesc(ep, ev.target.closest(".row-wrap"));
-      });
-      return s;
-    };
-    inner.appendChild(makeCopy());
+    inner.appendChild(this._makeTitleCopy(ep));
     wrap.appendChild(inner);
     return { wrap, inner };
+  }
+
+  // One marquee copy. Shared by the initial render and by the overflow
+  // upgrade in _checkOverflow, so both carry the identical click behaviour.
+  _makeTitleCopy(ep) {
+    const text = ep.title || "";
+    const span = this._el("span", "title-text", text);
+    span.title = text;
+    span.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      // title click toggles the description panel (not playback)
+      this._toggleDesc(ep, ev.target.closest(".row-wrap"));
+    });
+    return span;
   }
 
   _checkOverflow() {
@@ -768,15 +982,8 @@ class MapodcastsEpisodesCard extends HTMLElement {
       inner.dataset.measured = "1";
       if (inner.scrollWidth <= wrap.clientWidth + 2) return; // fits, no marquee
 
-      const sep = this._el("span", "title-sep", "·");
-      inner.appendChild(sep);
-      const s = this._el("span", "title-text", ep.title || "");
-      s.title = ep.title || "";
-      s.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        this._toggleDesc(ep, ev.target.closest(".row-wrap"));
-      });
-      inner.appendChild(s);
+      inner.appendChild(this._el("span", "title-sep", "·"));
+      inner.appendChild(this._makeTitleCopy(ep));
       inner.classList.add("overflowing");
       // ~50 px/s, at least 4 s per loop — a bit faster than before
       inner.style.animationDuration = `${Math.max(
@@ -784,6 +991,25 @@ class MapodcastsEpisodesCard extends HTMLElement {
         Math.round(inner.scrollWidth / 50)
       )}s`;
     });
+  }
+
+  // A star / bookmark toggle that visually belongs to the left button
+  // column. The icon swap is driven by the card re-render (the state lives
+  // in the sensor + the optimistic overrides), so this only has to build
+  // the button and forward the click.
+  _buildFlagButton({ iconOff, iconOn, active, label, variant, onClick }) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `flag-btn ${variant} ${active ? "active" : ""}`.trim();
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("aria-pressed", String(active));
+    btn.appendChild(this._haIcon(active ? iconOn : iconOff, "flag-ico"));
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      onClick();
+    });
+    return btn;
   }
 
   _buildRow(ep) {
@@ -817,6 +1043,38 @@ class MapodcastsEpisodesCard extends HTMLElement {
     row.appendChild(imgCol);
     this._loadImage(ep.image, img);
 
+    // Two more buttons stack under the play button in the expanded state:
+    // a podcast-level favourite (stored by Music Assistant) and an
+    // episode-level "save for later" (stored by this integration). Both are
+    // hidden while the row is collapsed — they are rendered inside the
+    // absolutely positioned button column, which the CSS only reveals for
+    // .row-wrap.expanded.
+    const favOn = this._effectiveFav(ep);
+    const favBtn = this._buildFlagButton({
+      iconOff: ICON_FAV_OFF,
+      iconOn: ICON_FAV_ON,
+      active: favOn,
+      variant: "on-fav",
+      label: favOn
+        ? this._pick("Kedvenc eltávolítása", "Remove from favourites")
+        : this._pick("Kedvencnek jelölés", "Mark as favourite"),
+      onClick: () => this._toggleFavorite(ep),
+    });
+    imgCol.appendChild(favBtn);
+
+    const savedOn = this._effectiveSaved(ep);
+    const saveBtn = this._buildFlagButton({
+      iconOff: ICON_SAVE_OFF,
+      iconOn: ICON_SAVE_ON,
+      active: savedOn,
+      variant: "on-save",
+      label: savedOn
+        ? this._pick("Mentett epizód törlése", "Remove from saved")
+        : this._pick("Mentés későbbre", "Save for later"),
+      onClick: () => this._toggleSaved(ep),
+    });
+    imgCol.appendChild(saveBtn);
+
     const body = this._el("div", "body");
 
     // row 1 — info strip: podcast name · published · length · remaining
@@ -845,6 +1103,18 @@ class MapodcastsEpisodesCard extends HTMLElement {
       meta.appendChild(this._el("span", "meta-sep", "·"));
       meta.appendChild(this._el("span", "duration", dur));
     }
+    // saved rows are marked, so they are recognisable at a glance and it is
+    // obvious *why* an episode is still listed weeks after it was published
+    if (this._isSavedRow(ep)) {
+      meta.appendChild(this._el("span", "meta-sep", "·"));
+      meta.appendChild(
+        this._el(
+          "span",
+          "saved-at",
+          `${this._pick("mentve", "saved")} ${this._relativeDate(ep.saved_at)}`
+        )
+      );
+    }
     const remSep = this._el("span", "meta-sep rem-sep", "·");
     remSep.style.display = "none";
     meta.appendChild(remSep);
@@ -870,7 +1140,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
     played.style.display = "none";
     actions.appendChild(played);
     const chev = this._haIcon("mdi:chevron-down", "chev");
-    chev.title = this._isHu() ? "Leírás" : "Description";
+    chev.title = this._pick("Leírás", "Description");
     chev.addEventListener("click", (ev) => {
       ev.stopPropagation();
       this._toggleDesc(ep, rowWrap);
@@ -901,23 +1171,42 @@ class MapodcastsEpisodesCard extends HTMLElement {
       }
       .header .refresh { cursor: pointer; color: var(--secondary-text-color); }
       .header .refresh:hover { color: var(--primary-color, #03a9f4); }
-      .header .fav-btn {
-        display: flex; align-items: center; gap: 6px;
+      /* 3-way list switch: exactly one list is shown at a time */
+      .view-switch {
+        display: flex; align-items: center; gap: 2px;
         margin-inline-start: auto;   /* right-align, keep space from the title */
         margin-inline-end: 8px;      /* spacing before the refresh button */
-        padding: 4px 12px; border-radius: 16px;
+        padding: 2px;
         border: 1px solid var(--divider-color, #444);
+        border-radius: 18px;
+      }
+      .view-switch .view-btn {
+        display: flex; align-items: center; justify-content: center;
+        width: 30px; height: 26px;
+        padding: 0; border: none; border-radius: 16px;
         background: transparent;
         color: var(--secondary-text-color);
-        font-size: 0.85em; cursor: pointer;
-        transition: color 0.15s ease, border-color 0.15s ease;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: color 0.15s ease, background 0.15s ease;
       }
-      .header .fav-btn:hover { color: var(--primary-color, #03a9f4); }
-      .header .fav-btn.active {
-        color: var(--warning-color, #ff9800);
-        border-color: currentColor;
+      .view-switch .view-btn:hover { color: var(--primary-color, #03a9f4); }
+      /* only the list that is currently shown is spelled out, so the switch
+         stays compact while the active bubble carries icon + label */
+      .view-switch .view-btn.active {
+        width: auto; padding: 0 11px; gap: 5px;
+        color: var(--primary-color, #03a9f4);
+        background: color-mix(in srgb,
+          var(--card-background-color, #fff) 88%,
+          var(--primary-text-color, #000));
       }
-      .header .fav-btn .fav-star { --mdc-icon-size: 18px; }
+      .view-switch .view-btn .view-label {
+        font-size: 0.8em; line-height: 1;
+        /* the label is small, so it needs a heavier weight to stay legible
+           against the accent colour of the active bubble */
+        font-weight: 600;
+      }
+      .view-switch .view-btn .view-ico { --mdc-icon-size: 18px; }
       .seek-strip {
         display: none; align-items: center; gap: 8px;
         margin-top: 10px;          /* extra space below the header */
@@ -979,8 +1268,57 @@ class MapodcastsEpisodesCard extends HTMLElement {
         filter: drop-shadow(0 0 4px var(--primary-color, #03a9f4));
       }
       .play-btn:active { transform: translateX(-50%) scale(0.95); }
-      .row.expanded .play-btn {
-        display: flex; align-items: center; justify-content: center;
+      /* note: only .row-wrap carries .expanded, so the play/flag buttons are
+         revealed by the .row-wrap.expanded rules above/below */
+      /* favourite / save-for-later buttons, stacked directly under the play
+         button in the same absolutely positioned column. They are only
+         revealed for an expanded row, and being out of flow they do NOT grow
+         the row height — the description panel still starts right under the
+         text. 32px steps on a 48px-wide column keep them gapless. */
+      .flag-btn {
+        display: none; position: absolute; left: 50%;
+        transform: translateX(-50%);
+        padding: 0; border: none; background: transparent;
+        color: var(--secondary-text-color); cursor: pointer;
+        transition: color 0.15s ease, transform 0.15s ease;
+      }
+      .row-wrap.expanded .flag-btn { display: flex; }
+      .flag-btn:hover {
+        color: var(--primary-color, #03a9f4);
+        transform: translateX(-50%) scale(1.12);
+      }
+      .flag-btn:active { transform: translateX(-50%) scale(0.95); }
+      .flag-btn .flag-ico { --mdc-icon-size: 26px; }
+      /* the favourite is owned by Music Assistant — warn it with amber,
+         like the header favourite did before */
+      .flag-btn.on-fav {
+        top: 86px; color: var(--secondary-text-color);
+      }
+      .flag-btn.on-fav.active { color: var(--warning-color, #ff9800); }
+      /* "saved for later" is local — highlight it in the accent colour */
+      .flag-btn.on-save { top: 118px; }
+      .flag-btn.on-save .flag-ico { --mdc-icon-size: 24px; }
+      .flag-btn.on-save.active { color: var(--primary-color, #03a9f4); }
+      /* short feedback for save / favourite actions */
+      .info-toast {
+        position: absolute; right: 16px; bottom: 16px; z-index: 20;
+        max-width: 80%;
+        background: var(--primary-text-color, #000);
+        color: var(--card-background-color, #fff);
+        padding: 8px 14px; border-radius: 8px;
+        font-size: 0.85em;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        animation: info-toast 2.4s ease forwards;
+      }
+      .info-toast.error {
+        background: var(--error-color, #db4437);
+        color: #fff;
+      }
+      @keyframes info-toast {
+        0% { opacity: 0; transform: translateY(6px); }
+        10% { opacity: 1; transform: translateY(0); }
+        85% { opacity: 1; transform: translateY(0); }
+        100% { opacity: 0; transform: translateY(0); }
       }
       .play-toast {
         position: absolute; left: 50%; top: 50%;
@@ -1034,7 +1372,8 @@ class MapodcastsEpisodesCard extends HTMLElement {
         text-decoration: underline;
         color: var(--primary-color, #03a9f4);
       }
-      .meta-sep, .date, .duration, .remaining { flex-shrink: 0; }
+      .meta-sep, .date, .duration, .remaining, .saved-at { flex-shrink: 0; }
+      .saved-at { opacity: 0.85; }
 
       /* row 2 — episode title marquee */
       .title-wrap { flex: 1; min-width: 0; overflow: hidden; }
@@ -1105,11 +1444,22 @@ class MapodcastsEpisodesCard extends HTMLElement {
   }
 
   _render() {
+    // drop the optimistic overrides the server has caught up with BEFORE
+    // the rows are read, so a rebuild never works from a stale override
+    this._pruneOverrides();
     const episodes = this._episodes();
     // volatile play-state fields must not trigger a full rebuild (they change
-    // on every play-state update); row-level updates handle those in place
+    // on every play-state update); row-level updates handle those in place.
+    // The optimistic overrides ARE part of the signature: a click has to
+    // rebuild the rows for the star / bookmark icons to flip.
     const stable = episodes.map(({ position: _position, state: _state, ...rest }) => rest);
-    const signature = JSON.stringify([stable, this._config, this._favOnly]);
+    const signature = JSON.stringify([
+      stable,
+      this._config,
+      this._view,
+      [...this._favOverride],
+      [...this._savedOverride].sort(),
+    ]);
     if (signature === this._lastSignature) {
       this._applyProgress();
       this._updateSeekStrip();
@@ -1117,6 +1467,85 @@ class MapodcastsEpisodesCard extends HTMLElement {
     }
     this._lastSignature = signature;
     this._rebuild(episodes);
+  }
+
+  // The 3-way list switch. Exactly one list is rendered at any time; the
+  // saved entry is only offered when the integration actually exposes the
+  // saved-episodes sensor (or the user turned it off).
+  _buildViewSwitch() {
+    const views = [
+      {
+        id: VIEW_ALL,
+        icon: "mdi:format-list-bulleted",
+        label: this._pick("Legfrissebb", "Latest episodes"),
+      },
+      {
+        id: VIEW_FAVORITES,
+        icon: this._view === VIEW_FAVORITES ? ICON_FAV_ON : ICON_FAV_OFF,
+        label: this._pick("Kedvencek", "Favorites"),
+      },
+    ];
+    if (this._config.show_saved && this._config.saved_entity) {
+      views.push({
+        id: VIEW_SAVED,
+        icon: "mdi:bookmark-multiple",
+        label: this._pick("Mentettek", "Saved"),
+      });
+    }
+    // never leave the card on a view that is no longer offered
+    if (!views.some((v) => v.id === this._view)) this._view = VIEW_ALL;
+
+    const group = this._el("div", "view-switch");
+    for (const view of views) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `view-btn${this._view === view.id ? " active" : ""}`;
+      btn.title = view.label;
+      btn.setAttribute("aria-label", view.label);
+      btn.setAttribute("aria-pressed", String(this._view === view.id));
+      btn.appendChild(this._haIcon(view.icon, "view-ico"));
+      // the label lives in the tooltip for the idle buttons and is spelled
+      // out next to the icon on the active bubble, so it is obvious which
+      // list is on screen
+      if (this._view === view.id) {
+        btn.appendChild(this._el("span", "view-label", view.label));
+      }
+      btn.addEventListener("click", () => {
+        if (this._view === view.id) return;
+        this._view = view.id;
+        this._closeDesc();
+        this._lastSignature = null; // force rebuild with the new list
+        this._render();
+      });
+      group.appendChild(btn);
+    }
+    return group;
+  }
+
+  _emptyLabel() {
+    // every branch is a plain _pick(hu, en) call — no nested ternaries
+    if (this._view === VIEW_SAVED) {
+      if (!this._config.saved_entity) {
+        return this._pick(
+          "Nincs mentett epizód szenzor.",
+          "No saved-episodes sensor available."
+        );
+      }
+      return this._pick("Még nincs elmentett epizód.", "No saved episodes yet.");
+    }
+    if (!this._config.entity) {
+      return this._pick("Nincs epizód.", "No episodes.");
+    }
+    if (this._view === VIEW_FAVORITES) {
+      if (!this._config.show_played) {
+        return this._pick(
+          "Nincs lejátszatlan kedvenc műsor.",
+          "No unplayed favourite podcasts."
+        );
+      }
+      return this._pick("Nincs kedvenc műsor.", "No favourite podcasts.");
+    }
+    return this._pick("Betöltés…", "Loading…");
   }
 
   _rebuild(episodes) {
@@ -1134,22 +1563,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
     titleWrap.appendChild(this._haIcon("mdi:microphone", null));
     titleWrap.appendChild(this._el("span", null, this._config.title));
     header.appendChild(titleWrap);
-    const favBtn = document.createElement("button");
-    favBtn.className = "fav-btn";
-    favBtn.title = this._isHu() ? "Kedvencek" : "Favorites";
-    favBtn.appendChild(
-      this._haIcon(this._favOnly ? "mdi:star" : "mdi:star-outline", "fav-star")
-    );
-    favBtn.appendChild(
-      this._el("span", null, this._isHu() ? "Kedvencek" : "Favorites")
-    );
-    favBtn.classList.toggle("active", this._favOnly);
-    favBtn.addEventListener("click", () => {
-      this._favOnly = !this._favOnly;
-      this._lastSignature = null; // force rebuild with the filter applied
-      this._render();
-    });
-    header.appendChild(favBtn);
+    header.appendChild(this._buildViewSwitch());
     const refreshBtn = this._haIcon("mdi:refresh", "refresh");
     refreshBtn.title = "Refresh";
     refreshBtn.addEventListener("click", () => this._refresh());
@@ -1171,9 +1585,7 @@ class MapodcastsEpisodesCard extends HTMLElement {
         }
       }
     } else {
-      const loading =
-        this._hass && this._config.entity ? "Loading…" : "No episodes.";
-      card.appendChild(this._el("div", "empty", loading));
+      card.appendChild(this._el("div", "empty", this._emptyLabel()));
     }
 
     root.appendChild(card);
@@ -1235,6 +1647,7 @@ class MapodcastsEpisodesEditor extends HTMLElement {
     // never rebuild on hass ticks — that resets the inputs being edited
     if (this._refs.entity) this._refs.entity.hass = hass;
     if (this._refs.player) this._refs.player.hass = hass;
+    if (this._refs.savedEntity) this._refs.savedEntity.hass = hass;
   }
 
   _stable(cfg) {
@@ -1339,6 +1752,34 @@ class MapodcastsEpisodesEditor extends HTMLElement {
     root.appendChild(checkWrap);
     this._refs.showPlayed = showPlayed;
 
+    const savedWrap = this._el("div", "check");
+    const showSaved = this._el("input");
+    showSaved.type = "checkbox";
+    showSaved.addEventListener("change", () =>
+      this._emit({ ...this._config, show_saved: showSaved.checked })
+    );
+    const savedLbl = this._el(
+      "label",
+      null,
+      'Saved episodes switch ("Mentettek" list)'
+    );
+    savedLbl.htmlFor = showSaved.id = "f-show-saved";
+    savedWrap.appendChild(showSaved);
+    savedWrap.appendChild(savedLbl);
+    root.appendChild(savedWrap);
+    this._refs.showSaved = showSaved;
+
+    const savedEntity = document.createElement("ha-entity-picker");
+    savedEntity.allowCustomEntity = true;
+    savedEntity.includeDomains = ["sensor"];
+    savedEntity.addEventListener("value-changed", (ev) =>
+      this._emit({ ...this._config, saved_entity: ev.detail.value || null })
+    );
+    root.appendChild(
+      this._field("Saved episodes sensor (auto-detected)", savedEntity)
+    );
+    this._refs.savedEntity = savedEntity;
+
     const seekWrap = this._el("div", "check");
     const seekCtl = this._el("input");
     seekCtl.type = "checkbox";
@@ -1371,6 +1812,8 @@ class MapodcastsEpisodesEditor extends HTMLElement {
     setIfIdle(this._refs.player, cfg.player ?? "");
     setIfIdle(this._refs.maxItems, cfg.max_items ?? 20);
     setIfIdle(this._refs.showPlayed, cfg.show_played !== false);
+    setIfIdle(this._refs.showSaved, cfg.show_saved !== false);
+    setIfIdle(this._refs.savedEntity, cfg.saved_entity ?? "");
     setIfIdle(this._refs.playbackControl, cfg.playback_control !== false);
   }
 

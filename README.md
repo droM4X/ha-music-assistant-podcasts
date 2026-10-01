@@ -25,7 +25,18 @@ library into a single Home Assistant sensor, with a custom dashboard card.
   whatever it is playing (not just podcasts); hidden when nothing is playing
 - Podcast name links to the podcast page in the Music Assistant web UI
 - Seamless marquee on overflowing episode titles (hover only)
-- Favourite shows
+- Favourite shows — and a star on every expanded row to toggle it straight
+  from the card (stored by Music Assistant, so it shows up in the MA web UI
+  too). Clearing a favourite needs the podcast's library id, so that travels
+  with each episode row
+- "Save for later" per episode: Music Assistant has no favourite-episode
+  concept, so saved episodes are stored by this integration in a Home
+  Assistant storage collection — they survive a restart, show up on every
+  device and are included in the HA backups. A saved row keeps its own copy
+  of the title, show, date, artwork, play state and description, and its
+  play button uses the real Music Assistant uri
+- The header holds a 3-way switch showing exactly one list at a time:
+  latest episodes · favourite shows · saved episodes
 - Auto-registered, versioned Lovelace card with an interactive editor and
   YAML mode; follows the Home Assistant language
 - Authenticated image/progress/description proxies — the Music Assistant
@@ -62,6 +73,8 @@ type: custom:music-assistant-podcasts-card
 player: media_player.my_player   # playback target (overrides the integration default)
 max_items: 20                    # rows shown
 playback_control: true           # seek buttons under the header (default on)
+show_played: true                # hide finished episodes (not applied to saved)
+show_saved: true                 # show the "saved" switch in the header (default on)
 ```
 
 ### Integration options

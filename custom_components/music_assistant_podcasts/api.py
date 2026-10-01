@@ -36,6 +36,7 @@ from .const import (
     EP_IMAGE,
     EP_PODCAST,
     EP_PODCAST_FAV,
+    EP_PODCAST_ITEM_ID,
     EP_PODCAST_URI,
     EP_POSITION,
     EP_PUBLISHED,
@@ -173,6 +174,10 @@ class MusicAssistantPodcastApi:
                     EP_PODCAST: podcast.name,
                     EP_PODCAST_FAV: bool(getattr(podcast, "favorite", False)),
                     EP_PODCAST_URI: podcast.uri,
+                    # MA can only clear a favourite by library item id (it
+                    # takes no uri on remove), so the card needs this to be
+                    # able to toggle a podcast back off.
+                    EP_PODCAST_ITEM_ID: podcast.item_id,
                     EP_URI: episode.uri,
                     EP_PUBLISHED: published,
                     EP_DURATION: episode.duration,
@@ -256,6 +261,49 @@ class MusicAssistantPodcastApi:
                 failed_feeds=failed,
                 feed_count=len(podcasts),
             )
+
+    # -- favorites --------------------------------------------------------
+
+    async def set_podcast_favorite(
+        self, podcast_uri: str, favorite: bool, library_item_id: str | int | None = None
+    ) -> None:
+        """Mark a library podcast as favorite (or clear it again).
+
+        The two directions use different MA commands: adding takes a uri
+        (the server resolves the item itself), while removing needs the
+        library item id plus the media type. Callers normally get the id from
+        the episode row; when it is missing we look the podcast up by uri.
+        """
+        async with self._session() as client:
+            if favorite:
+                await client.music.add_item_to_favorites(podcast_uri)
+                return
+
+            item_id = library_item_id
+            if item_id is None:
+                item_id = await self._lookup_library_item_id(client, podcast_uri)
+            if item_id is None:
+                raise MAConnectionError(
+                    f"Cannot clear the favourite flag of {podcast_uri}: "
+                    "library item id unknown"
+                )
+            await client.music.remove_item_from_favorites(
+                MediaType.PODCAST, item_id
+            )
+
+    @staticmethod
+    async def _lookup_library_item_id(
+        client: MusicAssistantClient, podcast_uri: str
+    ) -> str | int | None:
+        """Resolve a podcast's library item id from its uri."""
+        podcasts = await client.music.get_library_podcasts()
+        for podcast in podcasts:
+            if podcast.uri == podcast_uri:
+                return podcast.item_id
+        # last resort: the uri itself carries it (library://podcast/<id>)
+        if podcast_uri.startswith("library://podcast/"):
+            return podcast_uri.rsplit("/", 1)[-1]
+        return None
 
     # -- on-demand episode data -----------------------------------------
 

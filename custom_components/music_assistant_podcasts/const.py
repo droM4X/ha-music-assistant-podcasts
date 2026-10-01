@@ -6,10 +6,12 @@ DOMAIN = "music_assistant_podcasts"
 
 MANUFACTURER = "Music Assistant Podcasts"
 
+# Config option *names* (not secrets) — S105 would otherwise flag the
+# literals, hence the explicit suppression next to each.
 CONF_SERVER_URL = "server_url"
-CONF_TOKEN = "token"  # nosec: config option *name*, not a secret
+CONF_TOKEN = "token"  # noqa: S105 - config option name, never a value
 CONF_USERNAME = "username"
-CONF_PASSWORD = "password"  # nosec: config option *name*, not a secret
+CONF_PASSWORD = "password"  # noqa: S105 - config option name, never a value
 
 # Options
 CONF_EPISODES_PER_FEED = "episodes_per_feed"
@@ -32,6 +34,15 @@ ATTR_EPISODES = "episodes"
 ATTR_FEED_COUNT = "feed_count"
 ATTR_LAST_UPDATED = "last_updated"
 ATTR_FAILED_FEEDS = "failed_feeds"
+# marker attributes so the card can auto-detect the saved-episodes sensor
+# (and tell the two episode lists apart) without hardcoding entity ids
+ATTR_KIND = "kind"  # "latest" | "saved"
+ATTR_SAVED = "saved"
+ATTR_SAVED_AT = "saved_at"
+ATTR_DESCRIPTION = "description"
+
+KIND_LATEST = "latest"
+KIND_SAVED = "saved"
 
 # Episode dict keys (also consumed by the JS card)
 EP_TITLE = "title"
@@ -45,6 +56,10 @@ EP_PLAYED = "played"
 EP_STATE = "state"  # unplayed | in_progress | finished
 EP_IMAGE = "image"
 EP_PODCAST_FAV = "podcast_fav"
+# MA can only *remove* a favorite by (media_type, library_item_id) — it does
+# not accept a uri there, so the podcast's library id must travel with the
+# episode row or the toggle cannot be reverted.
+EP_PODCAST_ITEM_ID = "podcast_item_id"
 
 # Play-state sync
 # Short TTL for the api-level cache behind the card's progress polls (so
@@ -62,6 +77,20 @@ PLAY_STATE_TRACKED_TTL = 1800  # seconds
 # Descriptions are fetched on demand (they can be long, so they never go
 # into the episodes sensor) and effectively never change → long cache TTL.
 DESC_CACHE_TTL = 6 * 3600  # seconds
+
+# Locally saved episodes ("save for later")
+# Music Assistant has no concept of a favourite *episode*, so these are
+# stored by this integration in a plain HA storage collection: they survive
+# restarts, come back on every device that talks to this HA instance and
+# are included in the usual HA backups.
+STORAGE_KEY_SAVED = f"{DOMAIN}.saved_episodes"
+STORAGE_VERSION_SAVED = 1
+# Upper bound for the saved list — descriptions can be long, and the file is
+# kept in .storage forever.
+MAX_SAVED_EPISODES = 200
+# A single stored description longer than this is dropped (the episode row
+# itself is still saved).
+MAX_SAVED_DESCRIPTION_CHARS = 20000
 
 # Service names
 SERVICE_REFRESH = "refresh"

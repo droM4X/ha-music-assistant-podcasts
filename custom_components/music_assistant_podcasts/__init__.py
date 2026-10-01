@@ -28,6 +28,7 @@ from .const import (
 )
 from .coordinator import PlayStateCoordinator, PodcastsCoordinator
 from .services import async_register_services, async_unregister_services
+from .store import async_get_store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,6 +71,10 @@ async def _register_card_frontend(hass: HomeAssistant) -> None:
         hass.http.register_view(views.MAPodcastImageView())
         hass.http.register_view(views.MAPodcastProgressView())
         hass.http.register_view(views.MAPodcastDescriptionView())
+        # favourites on shows (MA backed) + locally saved episodes
+        hass.http.register_view(views.MAPodcastFavoriteView())
+        hass.http.register_view(views.MAPodcastSavedEpisodesView())
+        hass.http.register_view(views.MAPodcastSavedDescriptionView())
         registered["view_registered"] = True
 
     lovelace = hass.data["lovelace"]
@@ -122,6 +127,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async_register_services(hass)
 
+    # the saved-episode store is shared by every entry of this domain and
+    # must be loaded before the sensor platform is set up
+    store = async_get_store(hass)
+    await store.async_load()
+
     # 2) connect to Music Assistant and fetch data
     api = MusicAssistantPodcastApi(
         hass,
@@ -139,6 +149,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "api": api,
         "coordinator": coordinator,
         "play_coordinator": play_coordinator,
+        "store": store,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

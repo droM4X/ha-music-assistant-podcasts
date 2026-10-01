@@ -9,13 +9,23 @@ from aiohttp import ClientResponseError, web
 from homeassistant.components.http import KEY_HASS, HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from music_assistant_client.exceptions import MusicAssistantClientException
 
 from .api import (
+    AUTH_ERRORS,
     MAAuthError,
     MAConnectionError,
     MusicAssistantPodcastApi,
 )
-from .const import DOMAIN
+from .const import (
+    ATTR_DESCRIPTION,
+    ATTR_EPISODES,
+    DOMAIN,
+    EP_PODCAST_FAV,
+    EP_PODCAST_URI,
+    EP_URI,
+)
+from .store import SavedEpisodesFullError, async_get_store
 
 # Don't nudge the play-state coordinator more often than this from card polls
 # (async_request_refresh is debounced anyway, this just avoids the overhead).
@@ -36,6 +46,46 @@ def _first_play_coordinator(hass: HomeAssistant):
         if isinstance(data, dict) and data.get("play_coordinator") is not None:
             return data["play_coordinator"]
     return None
+
+
+def _coordinators(hass: HomeAssistant) -> list:
+    """Return the PodcastsCoordinator of every loaded entry."""
+    return [
+        data["coordinator"]
+        for data in hass.data.get(DOMAIN, {}).values()
+        if isinstance(data, dict) and data.get("coordinator") is not None
+    ]
+
+
+def _patch_podcast_favorite(
+    coordinators: list, podcast_uri: str, favorite: bool
+) -> None:
+    """Flip podcast_fav on the cached episode rows of every coordinator.
+
+    Music Assistant is the source of truth and already got the change, but
+    the episode list is only refreshed once an hour — patching it here makes
+    the sensor (and therefore the card) reflect the new star immediately
+    without paying for a full re-scan of every feed. The next scheduled
+    refresh overwrites this with the authoritative value.
+    """
+    for coordinator in coordinators:
+        data = coordinator.data
+        if not isinstance(data, dict):
+            continue
+        episodes = data.get(ATTR_EPISODES)
+        if not isinstance(episodes, list):
+            continue
+        changed = False
+        for episode in episodes:
+            if (
+                isinstance(episode, dict)
+                and episode.get(EP_PODCAST_URI) == podcast_uri
+                and episode.get(EP_PODCAST_FAV) != favorite
+            ):
+                episode[EP_PODCAST_FAV] = favorite
+                changed = True
+        if changed:
+            coordinator.async_set_updated_data(data)
 
 
 async def _parse_uris(request: web.Request) -> list[str]:
@@ -178,3 +228,136 @@ class MAPodcastDescriptionView(HomeAssistantView):
         except (MAConnectionError, OSError, TimeoutError):
             return web.json_response({}, status=502)
         return web.json_response(descriptions)
+
+
+class MAPodcastFavoriteView(HomeAssistantView):
+    """Authenticated endpoint toggling a podcast's Music Assistant favourite.
+
+    Music Assistant does support favourites on library podcasts, so this is a
+    thin, authenticated wrapper around the MA command — the card never sees
+    the MA token. The favourite flag also flips in the cached episode rows so
+    the sensor updates without a full feed refresh.
+    """
+
+    url = "/api/music_assistant_podcasts/favorite"
+    name = "api:music_assistant_podcasts:favorite"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Set (or clear) the favourite flag of one podcast."""
+        hass: HomeAssistant = request.app[KEY_HASS]
+        api = _first_api(hass)
+        if api is None:
+            return web.json_response({"error": "no_configured_integration"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON must 400, not 500
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        podcast_uri = body.get("podcast_uri")
+        favorite = body.get("favorite")
+        if not isinstance(podcast_uri, str) or not podcast_uri:
+            return web.json_response({"error": "'podcast_uri' is required"}, status=400)
+        if not isinstance(favorite, bool):
+            return web.json_response({"error": "'favorite' must be a bool"}, status=400)
+
+        raw_item_id = body.get("podcast_item_id")
+        item_id: str | int | None
+        if isinstance(raw_item_id, bool) or not isinstance(raw_item_id, (str, int)):
+            item_id = None
+        else:
+            item_id = raw_item_id
+
+        try:
+            await api.set_podcast_favorite(podcast_uri, favorite, item_id)
+        except AUTH_ERRORS as err:
+            return web.json_response({"error": str(err)}, status=401)
+        except (MAConnectionError, MusicAssistantClientException, OSError, TimeoutError) as err:
+            return web.json_response(
+                {"error": f"Music Assistant could not store the favourite: {err}"},
+                status=502,
+            )
+
+        _patch_podcast_favorite(_coordinators(hass), podcast_uri, favorite)
+        return web.json_response({"ok": True, "podcast_uri": podcast_uri, "favorite": favorite})
+
+
+class MAPodcastSavedEpisodesView(HomeAssistantView):
+    """CRUD endpoint for locally saved podcast episodes.
+
+    Music Assistant has no favourite-episode concept, so these rows live in a
+    Home Assistant storage collection (see store.py): they survive restarts,
+    show up on every device and land in the HA backups.
+    """
+
+    url = "/api/music_assistant_podcasts/saved_episodes"
+    name = "api:music_assistant_podcasts:saved_episodes"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return the saved episode rows (newest save first)."""
+        hass: HomeAssistant = request.app[KEY_HASS]
+        store = async_get_store(hass)
+        await store.async_load()
+        return web.json_response({"episodes": store.episodes()})
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Add or replace one saved episode."""
+        hass: HomeAssistant = request.app[KEY_HASS]
+        store = async_get_store(hass)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON must 400, not 500
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        if not isinstance(body, dict) or not isinstance(body.get("episode"), dict):
+            return web.json_response({"error": "'episode' object is required"}, status=400)
+
+        episode = body["episode"]
+        try:
+            await store.async_save_episode(
+                episode, description=episode.get(ATTR_DESCRIPTION)
+            )
+        except SavedEpisodesFullError as err:
+            return web.json_response({"error": str(err)}, status=409)
+        return web.json_response({"ok": True, "count": store.count()})
+
+    async def delete(self, request: web.Request) -> web.Response:
+        """Remove one saved episode and its stored metadata."""
+        hass: HomeAssistant = request.app[KEY_HASS]
+        store = async_get_store(hass)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON must 400, not 500
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        uri = body.get(EP_URI) if isinstance(body, dict) else None
+        if not isinstance(uri, str) or not uri:
+            return web.json_response({"error": "'uri' is required"}, status=400)
+
+        removed = await store.async_remove_episode(uri)
+        return web.json_response({"ok": True, "removed": removed, "count": store.count()})
+
+
+class MAPodcastSavedDescriptionView(HomeAssistantView):
+    """Returns descriptions of saved episodes straight from the local store.
+
+    Mirrors the /description endpoint for freshly fetched episodes: long
+    texts stay out of the sensor state and are only handed to the browser
+    when a description panel is actually opened.
+    """
+
+    url = "/api/music_assistant_podcasts/saved_description"
+    name = "api:music_assistant_podcasts:saved_description"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Return {episode_uri: description} for saved uris."""
+        hass: HomeAssistant = request.app[KEY_HASS]
+        try:
+            uris = await _parse_uris(request)
+        except web.HTTPBadRequest as err:
+            return web.json_response({"error": str(err)}, status=400)
+        store = async_get_store(hass)
+        await store.async_load()
+        return web.json_response(store.descriptions(uris))
