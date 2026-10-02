@@ -47,6 +47,8 @@ library into a single Home Assistant sensor, with a custom dashboard card.
 
 ## Setup
 ### HACS
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=droM4X&repository=ha-music-assistant-podcasts&category=integration)
+
 - HACS → top-right menu → Custom repositories
 - Repository: `droM4X/ha-music-assistant-podcasts`, Type: `Integration`
 - Restart Home Assistant after adding
